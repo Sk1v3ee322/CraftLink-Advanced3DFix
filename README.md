@@ -1,6 +1,6 @@
 # CraftLink Advanced 3D Fix
 
-**A community-built Dynamic Link prototype for Artcraft.**
+**A community-built CraftLink prototype for Artcraft.**
 
 ## Features
 
