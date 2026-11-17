@@ -26,3 +26,5 @@
 
 This is an unofficial community prototype.
 It is not affiliated with or endorsed by Artcraft.
+
+* **Original Developers:** Created by **[ArtCraft (`@storytold`)](https://github.com/storytold)** — check out their official GitHub organization and [website](https://getartcraft.com) for the original **EffectCraft** and **FilmCraft** applications (licensed under Apache-2.0).
