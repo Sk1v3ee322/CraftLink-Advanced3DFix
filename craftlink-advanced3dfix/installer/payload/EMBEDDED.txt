@@ -1,0 +1,6 @@
+# Programs carried inside CraftLink-Installer.exe.
+# offset and length locate the exact bytes in the shipped executable; sha256 proves them.
+# Regenerate this file whenever the installer is rebuilt.
+name	offset	length	sha256
+filmcraft.exe	285730	75833856	05398e18a1ca7bb1aa261dcdf7e8be32e25842894ee50836f1aa2f8ab9f97607
+effectcraft.exe	76119721	114521088	cfe1e2b3f68f5c291f8a68a7cbf87e44e9330cb22544c15d7e398e7b2c7417a1

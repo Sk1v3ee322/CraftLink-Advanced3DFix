@@ -1,0 +1,261 @@
+SUBJECT: FilmCraft 0.20.1 / EffectCraft 0.24.1 — CraftLink and Layer Styles on 3D text
+
+Hi!
+
+Attached are two independent pieces of work for FilmCraft 0.20.1 and EffectCraft 0.24.1.
+The patches were taken against the pristine release archives, apply separately, and do not
+overlap in files — each part can be reviewed and merged on its own.
+
+1. CRAFTLINK — FilmCraft → EffectCraft and back
+   In FilmCraft: right-click clips on the timeline →
+     "Replace with EffectCraft Composition"  — replaces the selection with one linked clip
+     "Send to EffectCraft…"                  — sends without changing the timeline
+   The selection is exported as FCP7 XML, a sidecar *.craftlink.json and a ProRes 4444 master
+   with alpha and PCM are written next to it; EffectCraft opens that as a composition.
+   Back: about 1 second after the last edit (or immediately on File ▸ Save) EffectCraft
+   re-renders the composition over the same master file; FilmCraft notices via a spool
+   notification in %TEMP%\CraftLink and re-reads the media. No need to save the project in
+   EffectCraft.
+   Bug fixed along the way: the fade-out at the end of the last selected clip was lost when a
+   transition sat on the selection boundary (one side inside, the other outside).
+   Both sides have regression tests.
+   Second bug fixed: on a project where nothing had ever been sent, the very first "Send to
+   EffectCraft" failed with a bare `os error 3` and wrote nothing (the second attempt worked).
+   Services::write_file writes atomically and does not create folders, and the CraftLink folder
+   was only created later, while baking the master. The bridge now creates the parent folder
+   before writing the XML, and reports the path if that fails. Regression test:
+   `the_first_bridge_run_creates_its_link_folder`.
+
+2. LAYER STYLES ON 3D TEXT — EffectCraft
+   Previously the styles (Stroke, Inner Shadow, Drop Shadow, Bevel, Satin, Overlays…) were
+   computed from the layer's flat source, and for extruded 3D text and shapes they never reached
+   the render at all — the extrusion was drawn from flat fill/stroke colours, so the styles were
+   silently dropped. Now the layer is rendered separately and the styles are computed from that
+   already rendered image (the way After Effects does it), then composited with depth taken into
+   account — so the styles follow the silhouette of the volume. Per-character 3D is styled per
+   glyph.
+   The GPU path does the same: read the frame back to the CPU, run the same style passes, then
+   hide behind nearer geometry. CPU/GPU comparison test: 0.000 % pixel difference,
+   max |Δ| = 0.0039 (≈1/255).
+
+WHAT IS IN THE ARCHIVE
+   01-filmcraft-0.20.1-craftlink.patch          27 files — CraftLink, FilmCraft side
+   02-effectcraft-0.24.1-craftlink.patch        12 files — CraftLink, EffectCraft side
+   03-effectcraft-0.24.1-3d-layer-styles.patch  10 files — Layer Styles on 3D
+   craftlink-patcher.exe                       applies all three patches; no git, no Python, no
+                                               network, no files beside it — it carries the patches
+                                               inside. See "EASIEST WAY" below.
+   changed-files/                               the same files complete (if replacing is easier)
+                                                NOTE: 45 files — 42 replace existing ones and 3 are
+                                                NEW (craftlink.rs, craftlink_bridge.rs,
+                                                craftlink_bridge_tests.rs), so add those rather than
+                                                overwrite. CRAFTLINK_ARCHITECTURE.md and
+                                                DYNAMIC_LINK_INTEGRATION.md are NEW files too — copy
+                                                them from the package root into the repo root.
+   FILES.txt                                    sizes and sha256 of the 45 files in changed-files/
+                                                (the two root documents are not listed there — check
+                                                them with sha256sum against the patch instead)
+   REPORT.md                                    detailed report: design, verification, tests
+   ОТЧЁТ.md / СООБЩЕНИЕ-РАЗРАБОТЧИКУ.txt        the same report and message in Russian
+   CRAFTLINK_ARCHITECTURE.md                    full CraftLink description (EN + RU)
+   DYNAMIC_LINK_INTEGRATION.md                  old document, marked DEPRECATED
+   screenshots/                                 before/after for the 3D styles
+   patcher/                                     Rust source of craftlink-patcher.exe; rebuild with
+                                                `cargo build --release` after editing the patches
+   installer/                                   Rust source of CraftLink-Installer.exe — the no-Rust
+                                                route: the two finished builds are carried inside it
+                                                (installer/payload/), so it needs no cargo, no source
+                                                tree. Rebuild with `cargo build --release` here too.
+                                                The builds themselves are not in this package — they
+                                                are output, reproducible from the patches; payload/
+                                                EMBEDDED.txt records their offset, length and sha256
+                                                inside the shipped installer instead.
+
+   Shipped separately, not inside this archive: craftlink-quick-patch/ — CraftLink-Installer.exe
+   (the no-Rust installer, ~182 MB, ~67 MB zipped, because it carries both finished builds),
+   Uninstall.bat for a one-click undo, README.txt and the screenshots, for people who just want
+   to install it without reading anything. It changes nothing here and does not depend on this
+   package; its source is installer/.
+
+   The patches are taken against the plain source archives of FilmCraft 0.20.1 and
+   EffectCraft 0.24.1 — no local commits of ours are assumed. Unpack both next to the
+   patch files before applying (the commands below use ../ paths).
+
+EASIEST WAY — craftlink-patcher.exe
+   One executable, no install, no git, no Python, no network. Put it anywhere and run:
+
+      craftlink-patcher.exe                     → asks for the folder, shows the check, confirms
+      craftlink-patcher.exe check <folder>      → dry run, writes nothing
+      craftlink-patcher.exe apply <folder>      → checks, then patches (asks before writing)
+      craftlink-patcher.exe uninstall <folder>  → puts the folder back exactly as it was
+      craftlink-patcher.exe revert <folder>     → restores only the overwritten files
+      craftlink-patcher.exe list                → the embedded patches
+      craftlink-patcher.exe help                → the same text
+
+   <folder> is the root of an unpacked release — the folder holding
+   apps/filmcraft/Cargo.toml or apps/effectcraft/Cargo.toml. It detects which one by itself;
+   dragging the folder into the window also works.
+
+   A portable folder or an installed copy cannot be patched: it holds the compiled exe, while
+   these patches edit sources and the app must be rebuilt. The patcher says so and gives the
+   route: patch the sources, `cargo build --release`, then copy target/release/<product>.exe
+   over the file in the portable folder (keeping the old one as a backup).
+
+   It is deliberately stricter than `patch -p1`:
+     - `check` never writes — every hunk is applied in memory only;
+     - `apply` plans everything first and refuses to touch a single file if one context line
+       disagrees, naming the file, the line, what it expected and what it found — so it cannot
+       half-patch a folder that is not the release it was built for;
+     - before overwriting, every file is copied to _craftlink-backup/<date>/ inside the release
+       folder, and the files it creates are listed there too, so the undo is complete;
+     - after writing, every file is re-hashed against FILES.txt and the result is printed:
+       "Verified against FILES.txt: 25 file(s) ok, plus 2 root document(s)" for FilmCraft,
+       20 + 2 for EffectCraft. A mismatch is an error, not a warning.
+
+   Expected: 27 files written for FilmCraft (23 replaced + 4 new: the two .md documents and two
+   new .rs files) and 22 for EffectCraft (19 replaced + 3 new). `uninstall` is a real undo — it
+   restores the replaced files, deletes the added ones and removes folders that became empty, so
+   the tree returns to the release state. Checked as a whole-tree comparison: 3487 files before,
+   3487 after, nothing missing, extra or changed. `revert` is the narrower variant: it restores
+   only the overwritten files and leaves the added ones in place, and says so.
+
+   The exe contains a copy of the three patches and of FILES.txt, so if the patches are ever
+   regenerated it must be rebuilt: `cd patcher && cargo build --release`. `cargo test` there runs
+   twelve tests: two fail if a patch and the embedded FILES.txt disagree, one fails if a patch no
+   longer parses, one holds the wording of the refusal for a portable build.
+
+   FOR PEOPLE WITHOUT RUST — CraftLink-Installer.exe (in craftlink-quick-patch/, source in
+   installer/)
+   The patcher edits sources, so it still needs cargo to produce a program. The installer does
+   not: the two finished builds are compiled into the exe with include_bytes!, so it installs by
+   copying, not by building. A person names a portable folder and is done.
+
+      CraftLink-Installer.exe                     → finds, shows, confirms
+      CraftLink-Installer.exe check <folder>      → dry run, writes nothing
+      CraftLink-Installer.exe install <folder>    → replaces the program (backup first)
+      CraftLink-Installer.exe uninstall <folder>  → puts the previous program back
+      CraftLink-Installer.exe list                → what is carried inside
+      CraftLink-Installer.exe help                → the same text
+
+   <folder> is a PORTABLE folder (filmcraft.exe / effectcraft.exe next to portable.txt). It also
+   looks one and two levels below, so either level of an archive that unpacked as name/name/ is
+   accepted, and naming a folder that contains both products installs both in one run. Dragging
+   the folder onto the exe does the same.
+
+   It refuses rather than guesses: the program already in the folder must hash to the official
+   build (SHA-256 pinned per product), so a different version or an already-changed build is
+   stopped, not overwritten. The whole job is validated before the first byte is written — if one
+   folder does not fit, nothing changes anywhere. It replaces exactly one file per folder; data/,
+   portable.txt, the licences and *-cli.exe are untouched. The old program goes to
+   _craftlink-backup/<date>/ with a REPLACED.txt, and uninstall returns the official bytes exactly
+   (verified on the pristine releases). `cargo test` in installer/ runs fifteen tests.
+
+   Cost: ~182 MB (~67 MB zipped) against the patcher's 643 KB — it carries a 72.3 MB and a
+   109.2 MB build. Its payload is what the patches produce, so the patches remain the authority.
+
+HOW TO APPLY (on pristine 0.20.1 / 0.24.1; the release folders and the patch files sit side by side)
+   cd filmcraft-0.20.1
+   git apply --check ../01-filmcraft-0.20.1-craftlink.patch
+   git apply         ../01-filmcraft-0.20.1-craftlink.patch
+
+   cd ../effectcraft-0.24.1
+   git apply ../02-effectcraft-0.24.1-craftlink.patch
+   git apply ../03-effectcraft-0.24.1-3d-layer-styles.patch
+
+   Without git:  patch -p1 < <file>.patch
+   The patches are LF-only and use a/... b/... paths, so -p1 (the git apply default).
+   Each patch was applied to a freshly extracted clean archive and compared with the working
+   tree - byte-for-byte match. No code file is touched by two patches; the two documents
+   (CRAFTLINK_ARCHITECTURE.md, DYNAMIC_LINK_INTEGRATION.md) appear in both CraftLink patches
+   because each repository gets its own copy in its own root.
+
+   The same was done with craftlink-patcher.exe itself, from fresh copies of both archives:
+   27/27 and 22/22 files came out byte-identical to the working tree, `uninstall` returned the
+   whole tree to the release state (3487 files, nothing missing, extra or changed), `revert`
+   restored all 23 replaced FilmCraft files to their original bytes, and pointing it at a folder
+   that is not the release made it exit 1 and write nothing.
+
+HOUSE RULES / CI GATES
+   AGENTS.md requires cargo xtask ci (fmt check, clippy -D warnings, tests). Before packaging:
+     cargo fmt --all --check                      clean in both repos
+                                                  (the pristine 0.20.1 / 0.24.1 are clean too,
+                                                   so this is a real gate, not a waiver)
+     cargo clippy --workspace --all-targets -- -D warnings
+                                                  EffectCraft: PASSES (exit 0)
+                                                  FilmCraft:   FAILS — but on PRE-EXISTING lints,
+                                                               not ours. See below.
+     cargo test -p filmcraft-engine craftlink     6 passed
+     cargo test -p effectcraft-engine craftlink   10 passed
+
+   The FilmCraft lint gate, so you are not surprised by it. Two pre-existing lints, both errors
+   under -D warnings:
+     error: this `if` guard returns a bool literal and is followed by another
+        --> crates/hevc/src/filter.rs:506:9
+   This appears identically on the untouched filmcraft-0.20.1.zip, and filmcraft-hevc is not one of
+   the 27 files these patches touch. It fires under the locally installed Rust 1.100.0 while the
+   project declares rust-version = "1.95"; on the targeted compiler the workspace gate is green.
+   The second is unused_mut on `let mut dir = std::fs::DirBuilder::new();` in
+   crates/engine/src/lib.rs (129 here, 126 in the pristine archive).
+   We deliberately left both alone rather than mix an unrelated fix into this patch. If you want a
+   green cargo xtask ci on that toolchain, it is a two-line change — happy to ship it as a
+   separate fourth patch.
+   No non-test code here uses unwrap/expect/panic/unreachable/todo/unimplemented or unsafe.
+
+HOW TO VERIFY
+   cargo build --release -p filmcraft --features filmcraft/neural-voices
+   cargo build --release -p effectcraft
+   cargo test -p filmcraft-engine craftlink
+   cargo test -p effectcraft-render --lib
+   cargo test -p effectcraft-gpu
+   cargo test -p effectcraft-engine craftlink
+
+   The official FilmCraft release builds with --features filmcraft/neural-voices (see
+   packaging/windows/package.ps1); a plain cargo build leaves the voice-over panel out.
+   CRAFT_FONTS_DIR is NOT needed to build — the archive ships assets/fonts/*.ttf. It is only
+   read by the effectcraft-ui-egui integration tests.
+
+   CraftLink by hand: select 2–3 clips → Replace with EffectCraft Composition → in EffectCraft
+   add e.g. a Glow and DO NOT save → after 1–2 s switch back to FilmCraft: the timeline already
+   shows it. Check the fade-out on the last clip. Restart both apps — the link must survive.
+   3D styles by hand: composition on Advanced 3D, text layer, 3D on,
+   Geometry Options ▸ Extrusion Depth > 0, Layer ▸ Layer Styles ▸ Stroke / Inner Shadow /
+   Drop Shadow — stroke and shadows must follow the projected silhouette of the volume,
+   including while rotating the camera and with Per-character 3D on. Compare with GPU off.
+
+THREE TEST FAILURES — ENVIRONMENT ONLY, NOT THE PATCH
+   - effectcraft-engine tests::blender::blender_export_defaults_and_script_escaping:
+     the test uses python3 as an AST oracle. On this machine python3 resolves to the 0-byte
+     Microsoft Store stub (%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe), which exits 9009
+     and parses nothing, so the assert fails at crates/engine/src/tests/blender.rs:181. The test
+     only skips when python3 is absent; with real Python 3 on PATH as python3 it passes.
+   - effectcraft-ui-egui native_menu::tests::every_engine_entry_is_in_the_native_menu and
+     panels::templates::tests::my_custom_rgb_dialog: the system locale is Russian while the
+     tests expect English labels (File vs Файл). They behave the same on a clean checkout
+     without these changes. That is two test functions, so three failures in total with the
+     python3 one above — all three reproduce on a clean checkout.
+
+OTHER RESULTS
+   filmcraft-engine        907 passed / 0 failed / 3 ignored
+   effectcraft-render      405 passed / 0 failed / 1 ignored
+   effectcraft-gpu         310 passed / 0 failed / 2 ignored
+   effectcraft-interchange 27 passed
+   effectcraft-aep         60 + 608 + 3 passed (three test binaries)
+   effectcraft-engine      1171 passed (except the python3 item)
+   effectcraft-ui-egui     540 passed (except the locale item)
+
+KNOWN LIMITATIONS (honest list)
+   - CraftLink is not per-frame: it renders 1 s after the last edit, on File ▸ Save, or via
+     file.craftlinkSync. One render at a time: an edit during a render is remembered and
+     rendered afterwards.
+   - The live link exists in the desktop build only (the browser build has no background thread).
+   - autoSync:false disables auto-refresh for a given link.
+   - 3D styles: one read-back per frame per styled extruded layer.
+   - Per-character styles are computed per glyph rather than for the word's overall silhouette —
+     a deliberate trade-off, letter planes in 3D do not form a single silhouette.
+
+The "before/after" screenshots for the 3D styles are inside the archive, in screenshots/: on the
+unpatched release the red Stroke is switched on but nothing is drawn (the red box you see is just
+the selection), and with the patch the stroke follows every glyph. They were taken at different
+camera angles, so treat them as illustration; rotate the camera yourself for the real check.
+
+Thanks!
