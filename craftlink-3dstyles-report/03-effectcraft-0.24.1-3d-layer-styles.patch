@@ -1,0 +1,460 @@
+--- a/crates/gpu/src/adv3d.rs
++++ b/crates/gpu/src/adv3d.rs
+@@ -814,6 +814,17 @@
+     height: u32,
+ }
+ 
++impl Resolved {
++    /// The camera-depth buffer (`BIG` where nothing was drawn), and the run's output size.
++    pub(crate) fn depth(&self) -> &wgpu::Buffer {
++        &self.depth
++    }
++
++    pub(crate) fn size(&self) -> (u32, u32) {
++        (self.width, self.height)
++    }
++}
++
+ /// The rasteriser's "nothing drawn" depth on the GPU (∞ on the CPU).
+ const BIG: f32 = 3.0e38;
+ 
+@@ -1050,11 +1061,15 @@
+ /// nearer (`adv::draw_run`'s 2D compositing path).
+ pub(crate) fn occluded(e: &mut Enc, iso: &Resolved, main: &Resolved, encode: bool) -> GpuImage {
+     let img = finish(e, iso, encode, None);
+-    let (w, h) = (iso.width, iso.height);
++    occluded_image(e, &img, &iso.depth, iso.width, iso.height, main)
++}
++
++/// [`occluded`] for an already finished image of the iso render (its depth is still `iso`'s):
++/// the layer's styles ran on the image on the CPU before the run's scene hid it.
++pub(crate) fn occluded_image(e: &mut Enc, img: &GpuImage, depth: &wgpu::Buffer, w: u32, h: u32, main: &Resolved) -> GpuImage {
+     let out = e.image(w, h);
+     let (iv, ov) = (img.texture.create_view(&Default::default()), out.texture.create_view(&Default::default()));
+-    let b =
+-        Binds { color: Some(&iv), bufs: [None, Some(&iso.depth), Some(&main.acc), None, Some(&main.depth), None, None], out: Some(&ov), ..Default::default() };
++    let b = Binds { color: Some(&iv), bufs: [None, Some(depth), Some(&main.acc), None, Some(&main.depth), None, None], out: Some(&ov), ..Default::default() };
+     dispatch(e, "occlude", [w, h, 0, 0], [0.0; 4], b, pixel_groups(w, h));
+     out
+ }
+--- a/crates/gpu/src/tests/adv3d.rs
++++ b/crates/gpu/src/tests/adv3d.rs
+@@ -464,6 +464,47 @@
+ }
+ 
+ #[test]
++fn gpu_styled_extrusions_match_cpu() {
++    let Some(g) = gpu() else { return };
++    let (mut p, cid) = scene_project();
++    // Extruded text with Layer Styles (a stroke and a drop shadow) on.
++    add(&mut p, cid, LayerSource::Text, |l| {
++        l.switches.three_d = true;
++        let doc = effectcraft_keyframe::TextDoc { text: "Ab".into(), size: 50.0, fill: [0.9, 0.8, 0.2, 1.0], apply_fill: true, ..Default::default() };
++        set(l, "text/sourceText", Value::Text(Box::new(doc)));
++        let mut next = 20_000u64;
++        l.props.children.push(build::extrusion_geometry_options(&mut build::Ids(&mut next)).into());
++        set(l, "geometryOptions/extrusionDepth", Value::Scalar(15.0));
++        set(l, "transform/position", Value::Vec3([120.0, 50.0, -30.0]));
++        set(l, "transform/rotationY", Value::Scalar(25.0));
++        for (style, props) in [
++            ("stroke", vec![("size", Value::Scalar(5.0)), ("color", Value::Color([1.0, 0.0, 0.0, 1.0]))]),
++            ("dropShadow", vec![("distance", Value::Scalar(8.0)), ("size", Value::Scalar(4.0))]),
++        ] {
++            effectcraft_project::styles::add_style(l, &mut build::Ids(&mut next), style, &Default::default(), true).unwrap();
++            for (k, v) in props {
++                l.props.prop_mut(&format!("layerStyles/{style}/{k}")).unwrap().value = v;
++            }
++        }
++    });
++    let (ctx, run) = run_of(&p, cid);
++    let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
++    let styled = run.iter().find(|l| matches!(l.source, LayerSource::Text)).unwrap();
++    assert!(adv::styled_geometry(&ctx, styled), "an extruded styled text takes the 2D compositing path");
++    assert!(r.prepare_adv_run(&ctx, &run, (240, 160)).is_none());
++    assert!(r.split_adv_run(&ctx, &run, (240, 160)).is_some());
++    let cpu = Renderer::new(&p, &NoFootage, RenderOpts::default()).comp_frame(cid, Tick::ZERO);
++    let red = cpu.data.iter().filter(|q| q[3] > 0.3 && q[0] > 0.4 && q[1] < 0.2 && q[2] < 0.2).count();
++    assert!(red > 200, "the stroke draws on the CPU: {red} red pixels");
++    let mut gr = Renderer::new(&p, &NoFootage, RenderOpts { backend: effectcraft_render::Backend::Gpu, ..Default::default() });
++    gr.accel = Some(&g);
++    let gimg = gr.comp_frame(cid, Tick::ZERO);
++    let (share, max) = off_share(&cpu.data, &gimg.data);
++    eprintln!("styled extrusions: {:.3} % beyond 1/255 (max {max:.4})", share * 100.0);
++    assert!(share <= 0.02, "{:.3} % of pixels differ (max {max})", share * 100.0);
++}
++
++#[test]
+ fn gpu_wireframes_match_cpu_exactly() {
+     let Some(g) = gpu() else { return };
+     let mut p = Project::default();
+--- a/crates/gpu/src/walk.rs
++++ b/crates/gpu/src/walk.rs
+@@ -168,9 +168,27 @@
+     };
+     for i in 0..split.len() {
+         let Some(iso) = crate::adv3d::resolve_run(e, &split.special(i))? else { continue };
+-        let iso = match &main {
+-            Some(m) => crate::adv3d::occluded(e, &iso, m, encode),
+-            None => crate::adv3d::finish(e, &iso, encode, None),
++        let layer = split.layer(i);
++        // Layers whose styles run over their 3D result (extruded text and shapes, per-character
++        // 3D text): finish the layer's own render, run its style passes on the CPU (as every
++        // layer's styles do), then hide it where the run's main scene is nearer.
++        let iso = if effectcraft_render::three_d::adv::styled_geometry(ctx, layer) {
++            let img = crate::adv3d::finish(e, &iso, encode, None);
++            let img = e.download(&img)?;
++            let img = effectcraft_render::three_d::adv::style_solo(r, ctx, layer, img);
++            let img = e.g.upload_image(&img)?;
++            match &main {
++                Some(m) => {
++                    let (iw, ih) = iso.size();
++                    crate::adv3d::occluded_image(e, &img, iso.depth(), iw, ih, m)
++                }
++                None => img,
++            }
++        } else {
++            match &main {
++                Some(m) => crate::adv3d::occluded(e, &iso, m, encode),
++                None => crate::adv3d::finish(e, &iso, encode, None),
++            }
+         };
+         let matte3d = split.with_matte3d(i, |p| match p {
+             None => Some(e.zeros(w, h)),
+--- a/crates/render/src/styles.rs
++++ b/crates/render/src/styles.rs
+@@ -686,6 +686,14 @@
+     Styled { passes, body: Buf { img: body, offset: buf.offset, scale: buf.scale } }
+ }
+ 
++/// The layer's styles flattened onto `content`: everything [`render`] makes composited into one
++/// buffer, for a 3D layer drawn as cards or planes (which can't carry the exterior passes
++/// separately). `layer_size` as in [`render`].
++pub fn styled_buf(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2]) -> Buf {
++    let st = render(ctx, layer, content, layer_size);
++    if st.passes.is_empty() { st.body } else { st.flatten() }
++}
++
+ /// Gradient Overlay frame in buffer pixels: centre and half extents.
+ fn gradient_frame(go: &GradOverlay, buf: &Buf, alpha: &Plane, layer_size: [f64; 2]) -> (f64, f64, f64, f64) {
+     let s = buf.scale;
+--- a/crates/render/src/tests/styles.rs
++++ b/crates/render/src/tests/styles.rs
+@@ -538,3 +538,95 @@
+     assert!(std::sync::Arc::ptr_eq(&hit.body, &first.body), "the cached body");
+     assert!(!hit.files.is_complete(), "{:?}", hit.files);
+ }
++
++/// A 3D text layer ("IO", white, 60 px) centred in the comp: an Advanced 3D comp when
++/// `advanced`, extruded (Geometry Options, Depth 20) when `extrude`.
++fn text_scene(advanced: bool, extrude: bool, edit: impl FnOnce(&mut Project, &Comp, &mut Layer)) -> (Project, ItemId) {
++    let (mut p, cid, comp) = setup();
++    p.comp_mut(cid).unwrap().renderer = if advanced { effectcraft_project::Renderer::Advanced3D } else { effectcraft_project::Renderer::Classic3D };
++    let mut l = build::layer(&mut p, &comp, "T", LayerSource::Text, (comp.width, comp.height), None);
++    l.switches.three_d = true;
++    let doc = effectcraft_keyframe::TextDoc { text: "IO".into(), size: 60.0, fill: [1.0, 1.0, 1.0, 1.0], apply_fill: true, ..Default::default() };
++    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(doc));
++    if extrude {
++        let mut next = 20_000u64;
++        l.props.children.push(build::extrusion_geometry_options(&mut build::Ids(&mut next)).into());
++        l.props.prop_mut("geometryOptions/extrusionDepth").unwrap().value = Value::Scalar(20.0);
++    }
++    edit(&mut p, &comp, &mut l);
++    p.comp_mut(cid).unwrap().layers = vec![l].into();
++    (p, cid)
++}
++
++fn red_stroke(p: &mut Project, c: &Comp, l: &mut Layer) {
++    add(p, c, l, "stroke");
++    set(l, "stroke/size", Value::Scalar(6.0));
++    set(l, "stroke/color", Value::Color([1.0, 0.0, 0.0, 1.0]));
++}
++
++fn red_pixels(img: &Image) -> usize {
++    img.data.iter().filter(|q| q[3] > 0.3 && q[0] > 0.4 && q[1] < 0.2 && q[2] < 0.2).count()
++}
++
++/// Layer Styles run after the layer's render, so an extruded 3D text carries them like a flat
++/// 2D or Classic 3D text does (Stroke around the projected silhouette included).
++#[test]
++fn extruded_3d_text_takes_layer_styles() {
++    let r = |advanced, extrude| {
++        let (p, cid) = text_scene(advanced, extrude, red_stroke);
++        red_pixels(&render(&p, cid))
++    };
++    let (classic, card, extruded) = (r(false, false), r(true, false), r(true, true));
++    assert!(classic > 500, "Classic 3D text: {classic} red stroke pixels");
++    assert!(card > 500, "Advanced 3D text card: {card} red stroke pixels");
++    assert!(extruded > 500, "Advanced 3D extruded text: {extruded} red stroke pixels");
++    // The extruded silhouette is the card's, so the stroke covers about as many pixels.
++    let (lo, hi) = ((card as f64 * 0.7) as usize, (card as f64 * 1.3) as usize);
++    assert!((lo..=hi).contains(&extruded), "the stroke follows the same silhouette: {extruded} vs {card}");
++}
++
++/// Per-character 3D text (After Effects' 3D Text) draws one plane per character, so its styles
++/// must run over the rasterised result too.
++#[test]
++fn per_char_3d_text_takes_layer_styles() {
++    let r = |advanced| {
++        let (p, cid) = text_scene(advanced, false, |p, c, l| {
++            l.props.prop_mut("text/perChar3d").unwrap().value = Value::Bool(true);
++            red_stroke(p, c, l);
++        });
++        red_pixels(&render(&p, cid))
++    };
++    let (classic, advanced) = (r(false), r(true));
++    assert!(classic > 500, "Classic 3D per-character text: {classic} red stroke pixels");
++    assert!(advanced > 500, "Advanced 3D per-character text: {advanced} red stroke pixels");
++}
++
++#[test]
++fn extruded_3d_text_takes_inner_and_drop_shadows() {
++    let (p, cid) = text_scene(true, true, |_, _, _| {});
++    let plain = render(&p, cid);
++    let text_bounds = plain.alpha_bounds().unwrap();
++    // Inner Shadow: the fill darkens inside the text's own alpha.
++    let (p, cid) = text_scene(true, true, |p, c, l| {
++        add(p, c, l, "innerShadow");
++        set(l, "innerShadow/size", Value::Scalar(4.0));
++        set(l, "innerShadow/opacity", Value::Scalar(100.0));
++    });
++    let img = render(&p, cid);
++    let min = (text_bounds.1..text_bounds.3)
++        .flat_map(|y| (text_bounds.0..text_bounds.2).map(move |x| (x, y)))
++        .filter(|&(x, y)| plain.get(x as i64, y as i64)[3] > 0.9)
++        .map(|(x, y)| img.straight(x as i64, y as i64)[0])
++        .fold(1.0f32, f32::min);
++    assert!(min < 0.8, "the inner shadow darkens the fill: {min}");
++    // Drop Shadow: the layer's pixels reach beyond the text, down-right of the global light.
++    let (p, cid) = text_scene(true, true, |p, c, l| {
++        add(p, c, l, "dropShadow");
++        set(l, "dropShadow/size", Value::Scalar(0.0));
++        set(l, "dropShadow/distance", Value::Scalar(10.0));
++        set(l, "dropShadow/opacity", Value::Scalar(100.0));
++    });
++    let img = render(&p, cid);
++    let styled = img.alpha_bounds().unwrap();
++    assert!(styled.2 > text_bounds.2 + 3 && styled.3 > text_bounds.3 + 3, "a drop shadow falls beyond the text: {styled:?} vs {text_bounds:?}");
++}
+--- a/crates/render/src/text.rs
++++ b/crates/render/src/text.rs
+@@ -1193,9 +1193,12 @@
+ }
+ 
+ /// Per-character 3D: each character as its own plane — (buffer in character space, character
+-/// space → layer space matrix).
++/// space → layer space matrix). A character's Layer Styles run on its own plane's pixels (a
++/// stroke and the shadows follow the glyph, and the whole layer's styles follow their union),
++/// as After Effects draws layer styles over the rendered layer.
+ pub fn per_char_planes(ctx: &EvalCtx, layer: &Layer, s: f64) -> Vec<(Buf, Mat4)> {
+     let Some(geom) = text_geom(ctx, layer) else { return vec![] };
++    let styled = crate::styles::active(ctx, layer);
+     let mut out = Vec::with_capacity(geom.glyphs.len());
+     for (gi, g) in geom.glyphs.iter().enumerate() {
+         if g.xf.opacity <= 0.0 {
+@@ -1210,7 +1213,15 @@
+         let mut img = Image::new(w, h);
+         let base = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
+         draw_glyphs(&geom, &mut img, &base, s, Some(gi));
+-        out.push((Buf { img, offset, scale: s }, g.m));
++        let buf = Buf { img, offset, scale: s };
++        let buf = if styled {
++            // Gradient Overlay without Align with Layer measures the character's own plane.
++            let size = [buf.img.width as f64 / s, buf.img.height as f64 / s];
++            crate::styles::styled_buf(ctx, layer, &buf, size)
++        } else {
++            buf
++        };
++        out.push((buf, g.m));
+     }
+     out
+ }
+--- a/crates/render/src/three_d/adv.rs
++++ b/crates/render/src/three_d/adv.rs
+@@ -16,7 +16,7 @@
+ pub mod scene;
+ pub mod shade;
+ 
+-use effectcraft_project::Layer;
++use effectcraft_project::{Layer, LayerSource};
+ use rayon::prelude::*;
+ 
+ pub use dof::depth_of_field;
+@@ -24,7 +24,7 @@
+ pub use scene::{EnvInfo, Light, Material, Scene, ShadowMap, TexInfo, Vertex};
+ 
+ use super::compose::camera_for;
+-use crate::{EvalCtx, Image, Renderer};
++use crate::{EvalCtx, Image, Renderer, styles};
+ 
+ /// Whether a comp draws its 3D layers with the Advanced 3D renderer: its own setting, or for a
+ /// collapsed precomp's layers, the setting of the outermost comp they collapse into.
+@@ -324,11 +324,78 @@
+     Some((solo, m.is_active_at(ctx.time)))
+ }
+ 
+-/// Layers whose blend mode, track matte or Preserve Transparency needs the 2D compositing path.
++/// Layers whose blend mode, track matte or Preserve Transparency needs the 2D compositing path,
++/// and extruded text/shape layers whose Layer Styles must be drawn over their 3D result.
+ fn needs_2d_composite(ctx: &EvalCtx, l: &Layer) -> bool {
+     l.blend_mode != effectcraft_color::BlendMode::Normal
+         || l.preserve_transparency
+         || l.track_matte.is_some_and(|tm| tm.layer != l.id && ctx.comp.layer(tm.layer).is_some())
++        || styled_geometry(ctx, l)
++}
++
++/// An extruded text/shape layer with Layer Styles on: its styles run on the layer's rasterised
++/// 3D result (as After Effects draws layer styles after the layer), so it is drawn on its own
++/// and composited in 2D. Flat cards already carry their styles in their texture
++/// (`blend_layer_buf` → `layer_buf`), and per-character 3D text styles each character's plane.
++pub fn styled_geometry(ctx: &EvalCtx, l: &Layer) -> bool {
++    matches!(l.source, LayerSource::Text | LayerSource::Shape) && scene::extrusion_params(ctx, l).is_some() && styles::active(ctx, l)
++}
++
++/// The layer's Layer Styles over its rasterised 3D result (`img`: the layer's own render in the
++/// canvas's encoding, with the layer's opacity already in it), flattened back into an image of
++/// the same size. The styles see the layer at full opacity (as in the 2D path, where opacity
++/// fades the whole styled stack), so the fade is divided out first and applied to the result.
++pub fn style_solo(r: &Renderer, ctx: &EvalCtx, layer: &Layer, img: Image) -> Image {
++    let Some((x0, y0, x1, y1)) = img.alpha_bounds() else { return img };
++    let (w, h) = (x1 - x0, y1 - y0);
++    let mut crop = Image::new(w, h);
++    for y in 0..h as usize {
++        let s = (y + y0 as usize) * img.width as usize + x0 as usize;
++        let d = y * w as usize;
++        crop.data[d..d + w as usize].copy_from_slice(&img.data[s..s + w as usize]);
++    }
++    let fade = (ctx.opacity(layer) * f64::from(r.opacity_mul)) as f32;
++    if fade > 1e-4 && fade < 1.0 {
++        let k = 1.0 / fade;
++        crop.data.iter_mut().for_each(|p| p.iter_mut().for_each(|c| *c = (*c * k).min(1.0)));
++    }
++    // The crop's place in the comp: output pixels → comp pixels, the region of interest's
++    // offset included. Styles measure in layer pixels, scaled with the render resolution.
++    let (ox, oy) = r.out_offset();
++    let s = r.opts.scale;
++    let buf = effectcraft_effects::Buf { img: crop, offset: [-(x0 as f64 + ox), -(y0 as f64 + oy)], scale: s };
++    // Gradient Overlay without Align with Layer measures the layer; the projected layer spans
++    // the comp's frame.
++    let size = [ctx.comp.width as f64, ctx.comp.height as f64];
++    let mut flat = styles::render(ctx, layer, &buf, size).flatten();
++    if fade > 1e-4 && fade < 1.0 {
++        flat.img.data.iter_mut().for_each(|p| p.iter_mut().for_each(|c| *c *= fade));
++    }
++    let mut out = Image::new(img.width, img.height);
++    let dx = (-flat.offset[0] - ox).round() as i64;
++    let dy = (-flat.offset[1] - oy).round() as i64;
++    blit(&flat.img, &mut out, dx, dy);
++    out
++}
++
++/// Copy `src` into `dst` at `(dx, dy)`, clipped to `dst`.
++fn blit(src: &Image, dst: &mut Image, dx: i64, dy: i64) {
++    let (dw, sw) = (dst.width as i64, src.width as i64);
++    let x0 = (-dx).max(0);
++    let x1 = (dw - dx).min(sw);
++    if x0 >= x1 {
++        return;
++    }
++    let n = (x1 - x0) as usize;
++    for sy in 0..src.height as i64 {
++        let ty = sy + dy;
++        if ty < 0 || ty >= dst.height as i64 {
++            continue;
++        }
++        let s = (sy * sw + x0) as usize;
++        let d = (ty * dw + dx + x0) as usize;
++        dst.data[d..d + n].copy_from_slice(&src.data[s..s + n]);
++    }
+ }
+ 
+ /// Draw a run of 3D layers with the Advanced 3D renderer into `canvas`.
+@@ -336,7 +403,10 @@
+ /// Layers with a blend mode, a track matte or Preserve Transparency can't blend inside the
+ /// depth-buffered scene: they are rendered on their own (lit by the same lights, through the
+ /// same camera), hidden where the rest of the run is nearer, then composited through the 2D
+-/// path (matte, Preserve Transparency, blend mode) from the farthest to the nearest.
++/// path (matte, Preserve Transparency, blend mode) from the farthest to the nearest. Extruded
++/// and per-character 3D text/shape layers with Layer Styles take the same path: their styles run
++/// over the rasterised 3D result ([`style_solo`]), as After Effects draws layer styles after the
++/// layer and not around its flat source.
+ pub(crate) fn draw_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], canvas: &mut Image) {
+     let out = (canvas.width, canvas.height);
+     let (special, plain): (Vec<&Layer>, Vec<&Layer>) = run.iter().copied().partition(|l| needs_2d_composite(ctx, l));
+@@ -352,6 +422,9 @@
+     }
+     for l in far_to_near(r, ctx, special) {
+         let Some((mut iso, depth)) = render_layers(r, ctx, &[l], out) else { continue };
++        if styled_geometry(ctx, l) {
++            iso = style_solo(r, ctx, l, iso);
++        }
+         if let Some((m, md)) = &main {
+             iso.data.par_iter_mut().zip(depth.par_iter()).zip(m.data.par_iter().zip(md.par_iter())).for_each(|((p, z), (q, mz))| {
+                 if *mz < *z - 0.01 * z.abs().max(1.0) {
+--- a/crates/render/src/three_d/compose.rs
++++ b/crates/render/src/three_d/compose.rs
+@@ -249,6 +249,8 @@
+ /// Prepare a layer as planes: one per character for per-character 3D text, else one.
+ pub(crate) fn prepare_all<'a>(r: &Renderer, ctx: &EvalCtx<'_>, layer: &'a Layer, order: usize, out: (u32, u32), in_run: bool) -> Vec<Item<'a>> {
+     if crate::text::per_char_3d(ctx, layer) {
++        // Per-character 3D draws each character as its own plane: `per_char_planes` runs the
++        // layer's styles on them.
+         return crate::text::per_char_planes(&r.with_reads(ctx), layer, r.opts.scale)
+             .into_iter()
+             .filter_map(|(buf, m)| {
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -1,6 +1,6 @@
+ # Architecture
+ 
+-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-29 · **Change:** minor (SAM 2 crate added to the layer table) · **Target:** Adobe After Effects 2026
++> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-16 · **Change:** layer styles follow 3D text and shapes through their rasterised result (`adv::styled_geometry`, `adv::style_solo`, `styles::styled_buf`) · **Target:** Adobe After Effects 2026
+ 
+ EffectCraft is a stack of small Rust crates. The engine knows nothing about the user interface;
+ the egui frontend, the command-line tool and the MCP server all sit on top of the same `Session`
+@@ -312,6 +312,15 @@
+ only (`layer.style.add` with `blendingOptions`), in the same undo step as the change. Removing
+ the last style keeps the group when its Advanced Blending is not at the defaults.
+ 
++Styles also follow 3D text and shape layers, whose rendered result is geometry rather than a card.
++An extruded layer with styles is drawn on its own by the Advanced 3D renderer
++(`adv::styled_geometry` → the split path), its own render is read back, and `adv::style_solo`
++runs the styles over those pixels (dividing the layer opacity out first and re-applying it after,
++so styles see a full-opacity layer as in the 2D path) before the result is hidden behind the nearer
++parts of the run and composited in 2D. On the GPU the same read-back runs through the CPU style
++passes (`gpu::walk::draw_split`). Per-character 3D text styles each character's plane instead
++(`text::per_char_planes` → `styles::styled_buf`), so a stroke and the shadows follow the glyphs.
++
+ **Paint and Puppet** are effects whose instances carry nested groups. Paint (`effects::paint`)
+ holds Brush / Clone / Eraser strokes (Path, Stroke Options, Transform, hidden Duration span);
+ strokes rasterize as brush-tip dabs and composite in order, and the layer cache key includes which
+@@ -365,13 +374,17 @@
+ (nearest depth), apply the depth-based iris depth of field with the Classic 3D bokeh spans
+ (`three_d::bokeh::kernel_spans`, highlight boost, progressive blur levels) and composite over the
+ GPU canvas; only the depth of field reads back its 8-byte radius range. Runs whose layers need
+-the 2D compositing path (blend modes, track mattes, Preserve Transparency) come to the GPU as a
++the 2D compositing path (blend modes, track mattes, Preserve Transparency, and extruded
++text/shape layers with Layer Styles) come to the GPU as a
+ `three_d::adv::SplitRun` (`Renderer::split_adv_run`, `draw_run`'s steps as data): the plain
+ layers render as one scene over the canvas, then each special layer, farthest first, renders on
+ its own, is hidden where the main scene is nearer (`occlude`), and goes through the 2D matte /
+ Preserve Transparency / blend kernels (a 3D track matte renders solo through the camera).
+ Environment Light Background layers draw their sky in a kernel (`adv_sky`, from
+-`Renderer::sky_draw`) before the rest of the run, in Classic and Advanced 3D comps. Wireframe
++`Renderer::sky_draw`) before the rest of the run, in Classic and Advanced 3D comps. A special
++layer whose styles run over its 3D result (`styled_geometry`: extruded text and shapes) is
++finished to an image, read back, styled by the CPU passes (`adv::style_solo`) and uploaded again
++before `occlude`. Wireframe
+ outlines draw on the GPU from the CPU's pixel list (`Renderer::wireframe_pixels`). GPU effects
+ (`effects::GPU_EFFECTS`, 280 of them: blurs, colour correction, keying incl. Screen Color Key, mattes,
+ channel, stylize, distortion and warps (Warp, Bezier Warp, Smear, Reshape, Two-Point Bend, CC Page
+--- a/docs/user/guides/add-an-effect.md
++++ b/docs/user/guides/add-an-effect.md
+@@ -30,6 +30,8 @@
+ 
+ For drop shadows, glows and bevels, use **Layer ▸ Layer Styles**. It lists **Drop Shadow**, **Inner Shadow**, **Outer Glow**, **Inner Glow**, **Bevel and Emboss** and **Satin**, among others.
+ 
++Styles apply to the layer as it renders: on 3D text they follow the projected result, so a Stroke runs around the extruded silhouette and the shadows fall from it, including with per-character 3D.
++
+ ## Next
+ 
+ [Render a video](render-a-video.md).

@@ -1,0 +1,2408 @@
+--- /dev/null
++++ b/CRAFTLINK_ARCHITECTURE.md
+@@ -0,0 +1,1210 @@
++# CraftLink — live composition link between FilmCraft and EffectCraft
++
++**Status:** implemented, compiled, unit-tested (17 Nov 2026)
++**Scope:** FilmCraft 0.20.1 + EffectCraft 0.24.1 (Rust)
++**Audience:** a developer or an AI agent who has to understand, maintain, port or re-implement the feature
++
++> This document describes the implementation as shipped in the three patches next to it
++> (`01-…filmcraft`, `02-…effectcraft`, `03-…3d-layer-styles`). Two bugs found while testing are
++> fixed in those patches and covered by regression tests: the disappearing fade-out at a selection
++> boundary, and the first bridge run failing with `os error 3` because the link folder did not exist
++> yet. Both are described in `REPORT.md` §1.7 and §1.9.
++
++---
++
++## 0. Clean-room statement
++
++CraftLink was written from the plain behaviour of the two applications and from **open, publicly
++documented formats only**:
++
++| Purpose | Format | Specification |
++| --- | --- | --- |
++| Timeline exchange | Final Cut Pro 7 XML (`<xmeml version="4">`) | open, widely documented interchange format |
++| Linked master | Apple ProRes 4444 in QuickTime, RGBA + PCM | openly documented codec and container |
++| Sidecar metadata | JSON (RFC 8259) | public standard |
++| Live notice | a file in the temp folder + JSON Lines over loopback | public standard |
++
++No proprietary project format, private protocol, shared library, decompiled binary, vendor
++documentation, string table or user interface of any third-party product was consulted. The
++feature is **not** an implementation of any commercial "dynamic link" product and is not
++affiliated with, endorsed by, or derived from one. Names, module layout, identifiers and the
++wire format below are original to this project. Anyone can rebuild CraftLink from this document
++alone.
++
++---
++
++## 1. What CraftLink does
++
++1. The editor selects one or more episodes (clips) on a FilmCraft timeline and right-clicks.
++2. **Replace with EffectCraft Composition** replaces the selection with a linked master clip and
++   opens the selection as a composition in EffectCraft.
++   **Send to EffectCraft** does the same without changing the FilmCraft timeline.
++3. The editor works in EffectCraft (adds Glow, masks, animation…).
++4. About a second after the last edit — or immediately on **File ▸ Save** — EffectCraft renders the
++   composition back over the same master file. Saving is optional: the link follows the edits.
++5. FilmCraft notices the change and re-reads the master, so the timeline shows the edit.
++
++The linked master is a real file on disk, so the link survives restarts, and either application
++can be closed and reopened without losing the connection.
++
++---
++
++## 2. Architecture
++
++```
++FilmCraft timeline
++  selection
++     │
++     ▼
++nest_selection_for_bridge ──► nested sequence (clips shifted to tick 0)
++     │
++     ├─ materialize_generators_for_export ──► procedural demos baked to MP4
++     ├─ export FCP7 XML  ───────────────────► <name>.xml
++     ├─ write_manifest   ───────────────────► <name>.craftlink.json
++     └─ bake_linked_master ─────────────────► CraftLink/<name>.mov  (ProRes 4444 + alpha + PCM)
++     │
++     ▼
++link_placed_clips_to_master ──► timeline clips now point at <name>.mov
++     │
++     ▼
++launch_or_notify_effectcraft ──► effectcraft.exe <name>.xml
++                                  (or loopback file.importTimeline when it is running)
++     │
++     ▼
++EffectCraft: file.importTimeline
++     ├─ import the XML into a composition
++     └─ register_import: Item.comment = "craftlink:{...}"   (survives project reload)
++     │
++     ▼
++editor changes the composition
++     │
++     ▼
++1 s after the last edit (craftlink_tick) or on File ▸ Save (auto_sync)
++     ├─ render_comp ──► <name>.partial.mov ──► rename over <name>.mov
++     ├─ spool: %TEMP%\CraftLink\reload-<pid>-<ms>.notify
++     └─ optional loopback: engine.execute "craftlink.refresh"
++     │
++     ▼
++FilmCraft tick_media_refresh sees the notice (polled every 0.5 s while the project shows a link)
++     └─ start_media_scan ──► apply_media_stamps ──► re-read <name>.mov
++     │
++     ▼
++timeline shows the EffectCraft edit
++```
++
++Two independent notification paths exist on purpose: the spool file needs no socket, no token
++and no port, and works even when FilmCraft was started without `--control`; the loopback request
++is a best-effort speed-up.
++
++---
++
++## 3. Data formats
++
++### 3.1 Exchange timeline — Final Cut Pro 7 XML
++
++Written by FilmCraft with
++`filmcraft_interchange::export(&project, sequence, Format::Fcp7Xml, &options)`.
++Read by EffectCraft through `effectcraft_interchange::import`, which delegates parsing to
++`filmcraft_interchange::import_with`.
++
++Only elements both applications already support are used: `sequence`, `media/video`,
++`media/audio`, `track`, `clipitem`, `file`, `transitionitem`, `filter` (Basic Motion, Opacity,
++Audio Levels, Audio Pan), markers. Nothing CraftLink-specific is added to the XML, so the file
++remains readable by any FCP7-XML consumer.
++
++### 3.2 Sidecar manifest — `<name>.craftlink.json`
++
++Written next to the XML by FilmCraft (`write_manifest`), read by EffectCraft
++(`source_for_timeline`).
++
++```json
++{
++  "craftlink": 1,
++  "composition": "CraftLink Comp 01",
++  "xml": "C:\\Projects\\Demo\\CraftLink Comp 01.xml",
++  "render": "C:\\Projects\\Demo\\CraftLink\\CraftLink Comp 01.mov",
++  "autoSync": true,
++  "application": "FilmCraft"
++}
++```
++
++| Field | Type | Meaning |
++| --- | --- | --- |
++| `craftlink` | integer | manifest version, currently `1` |
++| `composition` | string | the composition's name in FilmCraft |
++| `xml` | string | absolute path of the exchanged timeline |
++| `render` | string | absolute path of the linked master |
++| `autoSync` | bool | keep the master in sync automatically: re-render a second after an edit and on every save (default `true`) |
++| `application` | string | who created the link (`"FilmCraft"`) |
++
++The manifest is optional: a plain XML import without it behaves exactly like a normal timeline
++import and creates no link.
++
++### 3.3 Link persistence inside EffectCraft — `Item.comment`
++
++EffectCraft has no field for external links, so the manifest is stored in the composition item's
++existing comment field, on one line, prefixed with `craftlink:`:
++
++```
++craftlink:{"craftlink":1,"composition":"CraftLink Comp 01","xml":"…","render":"…","autoSync":true,"application":"FilmCraft"}
++```
++
++This needs **no project schema change** and is saved and loaded with the project. A comment that
++does not start with `craftlink:` is never interpreted as a link.
++
++Code: `CraftLinkSource::to_comment` / `CraftLinkSource::from_comment`.
++
++### 3.4 Live notice — `%TEMP%\CraftLink\reload-<pid>-<ms>.notify`
++
++- **Writer:** EffectCraft, after a successful render (`notify_filmcraft`).
++- **Body:** `{"craftlink":1,"render":"C:\\…\\<name>.mov"}`.
++- **Reader:** FilmCraft, every frame while the window is open
++  (`crates/ui-egui/src/app/frame.rs`, `craftlink_notify_pending` / `craftlink_clear_notices`).
++- **Lifetime:** consumed once a media scan starts; files older than 10 minutes are pruned by the
++  writer, so a crashed or closed receiver leaves no permanent litter.
++
++The receiver does not parse the path; it only needs to know that something changed, because the
++regular media watcher re-stamps and re-reads every file the project uses.
++
++### 3.5 Optional loopback request
++
++If `FILMCRAFT_CONTROL_TOKEN` is present in the environment (64 hex characters, inherited by the
++EffectCraft process that FilmCraft launched), EffectCraft also sends one JSON line to FilmCraft's
++control server:
++
++```json
++{"token":"<64 hex>","method":"engine.execute","params":{"command":"craftlink.refresh","params":{}}}
++```
++
++Ports tried: `filmcraft_control.json` (working directory and temp folder, `port` field) then
++`9876`. Without a token FilmCraft keeps its listener closed by design, so this path is optional.
++
++---
++
++## 4. FilmCraft changes
++
++### 4.1 Files
++
++| File | Change |
++| --- | --- |
++| `crates/engine/src/craftlink_bridge.rs` | **new** — the whole FilmCraft side |
++| `crates/engine/src/craftlink_bridge_tests.rs` | **new** — 6 unit tests |
++| `crates/engine/src/lib.rs` | module registered (`pub mod craftlink_bridge`, tests module under `#[cfg(test)]`) |
++| `crates/engine/src/commands.rs` | 3 commands registered |
++| `crates/engine/src/clip_ops.rs` | context-menu ordering |
++| `crates/engine/src/media_watch.rs` | `Session::note_media_stamp`, `watches_linked_master` |
++| `crates/ui-egui/src/app/frame.rs` | spool polling in `tick_media_refresh` (0.5 s while a link is shown), after the existing `has_media_files` check |
++| `crates/ui-egui/src/panels/timeline/menus.rs` | two context-menu labels |
++| `crates/ui-egui/src/i18n/*.tsv` | 3 strings × 16 catalogs |
++| `apps/filmcraft/src/main.rs` | console window removed from release builds (`windows_subsystem`, no longer gated on `debug_assertions`) |
++
++### 4.2 Function reference (`crates/engine/src/craftlink_bridge.rs`)
++
++| Function | Responsibility |
++| --- | --- |
++| `next_craftlink_comp_name(s)` | first unused `CraftLink Comp NN` name |
++| `link_folder(s)` | `<project folder>/CraftLink`, or `%TEMP%/CraftLink` for an unsaved project |
++| `master_path(s, name)` | `<link_folder>/<name>.mov` |
++| `manifest_path(xml)` | `<stem>.craftlink.json` next to the XML |
++| `nest_selection_for_bridge(s, name, replace)` | builds the nested sequence from the selection, shifts it to tick 0, copies transitions, trims boundary transitions (see §6), optionally replaces the selection on the active timeline |
++| `bake_demo_scene(scene, duration)` | renders one procedural demo generator to a real H.264 MP4 |
++| `materialize_generators_for_export(s, nid)` | replaces generator media items in the nested sequence with those MP4 files |
++| `bake_linked_master(s, nid, path, duration)` | renders the sequence to ProRes 4444 with alpha and audio |
++| `write_manifest(s, xml, master, name, auto_sync)` | writes the sidecar JSON |
++| `link_placed_clips_to_master(s, placed, name, master)` | adds a media item for the master, repoints the placed clips at it, and baselines its media stamp |
++| `execute_bridge(s, p, replace)` | orchestration for both send commands |
++| `refresh_linked(s, p)` | `craftlink.refresh` — `media_watch::refresh_changed` + toast |
++| `launch_or_notify_effectcraft(xml)` | loopback first, then launch `effectcraft.exe`, else report `saved_only` |
++| `find_effectcraft_exe()` | `EFFECTCRAFT_PATH`, next to the exe, `../EffectCraft/`, `../../EffectCraft/`, `Program Files`, `PATH` |
++
++### 4.3 Commands
++
++| Command | Menu | Parameters | Result |
++| --- | --- | --- | --- |
++| `clip.replaceWithCraftLink` | Clip | `{name?, path?, autoSync?, launch?}` | `{sequence, clips, path, name, start, duration, effectcraft, craftlink, replaced:true}` |
++| `clip.sendToCraftLink` | Clip | `{name?, path?, autoSync?, launch?}` | same, `replaced:false` |
++| `craftlink.refresh` | — | `{}` | `media.refreshChanged` result |
++
++`launch:false` skips starting EffectCraft (tests, agents); `autoSync:false` makes EffectCraft
++stop re-rendering on save for this link.
++
++The `craftlink` object in the result is:
++
++```json
++{"linked": true, "render": "…\\CraftLink\\CraftLink Comp 01.mov", "autoSync": true}
++```
++
++`linked` is `false` when the master could not be read back (the timeline then keeps the nested
++composition, which renders the same content), and `error` explains why.
++
++### 4.4 Media watcher addition
++
++`Session::note_media_stamp(path)` records the current size/mtime of a media file as the baseline.
++It is called right after the linked master is inserted, because the watcher deliberately treats
++`None → Some` as "not changed" (a file that did not exist at the last look is not a file that
++changed). Without this baseline, a save in EffectCraft that happened before FilmCraft's first
++timed scan would be missed.
++
++### 4.5 UI
++
++- Timeline clip context menu: **Replace with EffectCraft Composition**, **Send to EffectCraft**.
++- Clip menu: same commands.
++- `tick_media_refresh` forces a scan as soon as a `.notify` file exists, even when
++  *Automatically refresh growing files* is off.
++- A project that shows a linked master (`media_watch::watches_linked_master`: a media file inside
++  a `CraftLink` folder) polls the spool folder every 0.5 s, so a live render shows at once instead
++  of on the next timed scan (which can be a minute away). The periodic scan still obeys
++  *Automatically refresh growing files*; the CraftLink notice does not.
++
++---
++
++## 5. EffectCraft changes
++
++### 5.1 Files
++
++| File | Change |
++| --- | --- |
++| `crates/engine/src/craftlink.rs` | **new** — manifest, comment persistence, sync, live link, notice |
++| `crates/engine/src/cmd/timeline.rs` | `prerender_cx`, `render_comp`, import registration, 3 command specs (`file.sendToFilmCraft`, `file.craftlinkSync`, `file.craftlinkStatus`) |
++| `crates/engine/src/cmd.rs` | `pub(crate) mod timeline` |
++| `crates/engine/src/cmd/file.rs` | `auto_sync` after `save` / `saveAs` |
++| `crates/engine/src/lib.rs` | `mod craftlink`, `pub use craftlink::LiveSync`, `Session::craftlink_live` |
++| `crates/engine/src/session/dispatch.rs` | `craftlink_note_change` after a command that changed `revision` |
++| `crates/ui-egui/src/app/frame.rs` | `craftlink_tick(self.now)` in the logic tick |
++| `crates/engine/src/menus.rs` | File ▸ Export entries |
++| `crates/engine/src/tests/timeline_interchange.rs` | test `send_to_filmcraft_exports_xml` |
++| `apps/effectcraft/src/main.rs` | a timeline file (`.xml`/`.fcpxml`/`.otio`/`.edl`/`.aaf`/`.omf`) given on the command line opens as a timeline; console window removed |
++
++### 5.2 Function reference (`crates/engine/src/craftlink.rs`)
++
++| Function | Responsibility |
++| --- | --- |
++| `CraftLinkSource::from_value / to_value` | manifest ⇄ struct |
++| `CraftLinkSource::to_comment / from_comment` | persistence in `Item.comment` |
++| `manifest_path(xml)` | sidecar path |
++| `source_for_timeline(xml)` | read the sidecar |
++| `source_of(s, cid)` | read the link from the composition's comment |
++| `partial_path(render)` | `foo.mov` → `foo.partial.mov` |
++| `notify_filmcraft(render)` | spool file + pruning + optional loopback |
++| `notify_filmcraft_control()` | authenticated JSON-lines request |
++| `spawn_render(s, cid, src, wait, quiet)` | render to `.partial.mov`, rename over the master, notify |
++| `sync(s, p)` | `file.craftlinkSync` |
++| `status(s, p)` | `file.craftlinkStatus` |
++| `auto_sync(s)` | re-render every `autoSync` link after a save |
++| `craftlink_note_change(id)` | arm the live link after an edit (skips saves, opens, imports) |
++| `craftlink_tick(now)` | render the armed link once the quiet period is over |
++| `craftlink_live_pending()` | whether a live render is owed (the frontend's repaint hint) |
++| `register_import(project, comps, xml)` | write the comment on import |
++
++### 5.3 Whole-composition render (`crates/engine/src/cmd/timeline.rs`)
++
++`render_comp(cx, project, cid, path, progress)` builds one `RenderQueueItem`:
++
++```
++time_span      = TimeSpan::LengthOfComp
++output.format  = OutputFormat::ProRes
++channels       = Channels::Rgba
++prores_profile = ProResProfile::P4444
++audio          = AudioOutput::Auto
++output.output  = path
++```
++
++and hands it to the session's `Exporter`. `prerender_cx(s)` collects the encoder, footage source,
++expression host, GPU accelerator and the *Switches Affect Nested Comps* preference, exactly as
++timeline export does, so a render in the background sees the same project as the UI.
++
++### 5.4 Commands
++
++| Command | Menu | Parameters | Result |
++| --- | --- | --- | --- |
++| `file.craftlinkSync` | File ▸ Export ▸ Update CraftLink Render | `{comp?, background?}` | `{comp, render, xml}` (or `{job}` when `background:true`) |
++| `file.craftlinkStatus` | — | `{comp?}` | `{linked, composition, xml, render, autoSync, application, exists, bytes, modified}` |
++| `file.sendToFilmCraft` | File ▸ Export ▸ Send to FilmCraft… | `{comp?, path?}` | `{comp, name, path, export, filmcraft}` — `filmcraft.status` is one of `connected_to_control_server`, `launched`, `launch_failed`, `saved_only` |
++
++`file.sendToFilmCraft` is the reverse direction: it exports the active composition as a Final Cut Pro
++XML, then hands the file to a running FilmCraft over the control channel
++(`engine.execute` → `file.import`), or starts `filmcraft.exe` on it, or leaves the `.xml` on disk
++(`saved_only`). `find_filmcraft_exe` looks at `FILMCRAFT_PATH`, next to the exe, `../FilmCraft/`,
++`../../FilmCraft/`, `Program Files` and `PATH`, in that order.
++
++### 5.5 Save hook
++
++`crates/engine/src/cmd/file.rs`:
++
++```rust
++fn save(s, p)    { let r = save_to(s, &path)?; crate::craftlink::auto_sync(s); Ok(r) }
++fn save_as(s, p) { let r = save_to(s, path)?;  crate::craftlink::auto_sync(s); Ok(r) }
++```
++
++`save_to` itself is **not** hooked, so autosave, *Increment and Save* and recovery saves do not
++trigger renders. `auto_sync` skips when a `craftlink` task is already running (one render at a
++time) and only considers links whose `autoSync` is true.
++
++### 5.6 Live link (no save needed)
++
++The master follows the edits without File ▸ Save:
++
++| Piece | Where | What it does |
++| --- | --- | --- |
++| `Session::craftlink_live: LiveSync` | `lib.rs`, `craftlink.rs` | `{dirty, since, seen, comp, rendered}`: the debounce state |
++| `craftlink_note_change(id)` | `session/dispatch.rs` | after any command that advanced `revision`: arms the link for the composition that was active; saves, opens, reverts and imports only mark the revision as seen |
++| `craftlink_tick(now)` | `ui-egui/src/app/frame.rs` | once no edit arrived for `LIVE_DELAY` (1.0 s), starts one quiet `spawn_render` |
++| `craftlink_live_pending()` | `ui-egui/src/app/frame.rs` | keeps a 120 ms repaint coming while a render is owed |
++| `watches_linked_master(project)` | FilmCraft `media_watch.rs` | a project with a media file inside a `CraftLink` folder polls the spool every 0.5 s |
++
++Rules:
++
++- Only the composition that was **active** when the edit happened is re-rendered; switching comps
++  mid-edit does not render the other one.
++- One render at a time: an edit during a render is remembered and rendered after it, not stacked.
++- `autoSync: false` disables the live link as well; only `file.craftlinkSync` and *File ▸ Save*
++  render such a link.
++- The live render is quiet (no toast); only the explicit sync and saves report.
++- The engine has no clock, so the debounce is driven by the frontend's monotonic `AppClock::now()`
++  passed into `craftlink_tick`.
++
++---
++
++## 6. The missing fade-out fix
++
++### Symptom
++
++After sending a selection to EffectCraft, a fade-out at the end of the **last selected clip** was
++missing in EffectCraft (reported with a screenshot).
++
++### Cause
++
++A transition can straddle the selection boundary: its outgoing side is selected, its incoming
++side is not. The previous bridge copied a transition only when **both** sides were selected, so
++the boundary transition was dropped and the outgoing clip lost its fade.
++
++### Fix
++
++`nest_selection_for_bridge` now keeps every transition that has at least one side in the
++selection and turns the missing side into "black":
++
++| Original | Selection | Result |
++| --- | --- | --- |
++| `from = A`, `to = B` | A only | `from = A`, `to = None` → `end-black` (fade-out) |
++| `from = A`, `to = B` | B only | `from = None`, `to = B` → `start-black` (fade-in) |
++| `from = None`, `to = B` | B | unchanged → `start-black` |
++| `from = A`, `to = None` | A | unchanged → `end-black` |
++| both sides outside | — | dropped |
++| both sides become `None` | — | dropped |
++
++The transition is then **trimmed to the selected clip's own extent** — but only when it actually
++lost its other side to black; a transition with both sides in the selection (a cross dissolve
++between two selected clips) is copied whole:
++
++- fade-out (`from` selected): `end = min(transition.end, clip.end)`,
++  `duration = end - start`;
++- fade-in (`to` selected): `start = max(transition.start, clip.start)`,
++  `duration = end - start`.
++
++The FCP7 writer emits `start-black` / `end-black` from `(from, to)` (`write_transition`,
++`crates/interchange/src/fcp7.rs`). EffectCraft's importer already maps those to opacity
++keyframes (`crates/interchange/src/import.rs`):
++
++```rust
++if tr.to == Some(clip)          { fades.push((start, end, 0.0, 1.0)); } // fade in
++if tr.from == Some(clip) && tr.to.is_none() { fades.push((start, end, 1.0, 0.0)); } // fade out
++```
++
++Because the transition was trimmed, the fade-out now covers the clip's last frames instead of
++extending past its end.
++
++Regression test: `boundary_transition_becomes_a_one_sided_fade` and
++`a_cross_dissolve_between_two_selected_clips_keeps_both_sides`
++(`crates/engine/src/craftlink_bridge_tests.rs`).
++
++---
++
++## 7. Live-sync sequence, step by step
++
++1. **FilmCraft** — the editor selects clips, runs `clip.replaceWithCraftLink`.
++2. `nest_selection_for_bridge` creates the nested sequence (and, for *replace*, swaps the
++   selection for a nested-sequence clip).
++3. `materialize_generators_for_export` bakes procedural demo generators to MP4 (EffectCraft has no
++   FilmCraft generators).
++4. `filmcraft_interchange::export` writes `<name>.xml`.
++5. `bake_linked_master` renders `CraftLink/<name>.mov` (ProRes 4444 + alpha + PCM) and
++   `write_manifest` writes `<name>.craftlink.json`.
++6. `link_placed_clips_to_master` adds a media item for the master, repoints the placed clips at
++   it and records the media stamp.
++7. `launch_or_notify_effectcraft` asks a running EffectCraft to import the XML (loopback) or
++   starts `effectcraft.exe <xml>`.
++8. **EffectCraft** — `file.importTimeline` imports the XML, then `register_import` writes
++   `craftlink:{…}` into the composition's comment.
++9. The editor adds effects (Glow, masks…) and saves.
++10. `auto_sync` → `spawn_render` → `render_comp` writes `<name>.partial.mov`, renames it over
++    `<name>.mov`, then `notify_filmcraft` writes the spool notice.
++11. **FilmCraft** — `tick_media_refresh` sees the notice, starts a media scan, the scan re-reads
++    the changed master, the timeline repaints with the new render.
++
++Latency: the render time (whole composition) plus one UI frame. There is no per-frame streaming.
++
++---
++
++## 8. Settings and defaults
++
++| Setting | Where | Default |
++| --- | --- | --- |
++| *Automatically refresh growing files* | FilmCraft ▸ Settings ▸ Media | on |
++| *Refresh growing files every* | FilmCraft ▸ Settings ▸ Media | 60 s |
++| `autoSync` | command parameter / manifest | `true` |
++| `launch` | command parameter | `true` |
++
++The CraftLink notice forces a scan even when the automatic refresh is off.
++
++---
++
++## 9. Build and test
++
++The project builds with the `stable-x86_64-pc-windows-gnullvm` toolchain (no MSVC `link.exe`).
++
++```powershell
++# FilmCraft
++cd filmcraft-0.20.1
++cargo build --release -p filmcraft
++cargo test -p filmcraft-engine craftlink
++
++# EffectCraft
++cd effectcraft-0.24.1
++cargo build --release -p effectcraft
++cargo test -p effectcraft-engine craftlink
++cargo test -p effectcraft-engine menus::tests
++```
++
++Expected CraftLink tests:
++
++```
++craftlink_bridge_tests::craftlink_fails_when_no_clips_selected            ok
++craftlink_bridge_tests::replace_with_craftlink_creates_xml_and_replaces_on_timeline   ok
++craftlink_bridge_tests::send_to_craftlink_keeps_original_timeline         ok
++craftlink_bridge_tests::boundary_transition_becomes_a_one_sided_fade      ok
++craftlink_bridge_tests::a_cross_dissolve_between_two_selected_clips_keeps_both_sides ok
++craftlink_bridge_tests::the_first_bridge_run_creates_its_link_folder         ok
++craftlink::tests::a_manifest_round_trips_through_a_comment                ok
++craftlink::tests::a_plain_comment_is_not_a_link                           ok
++craftlink::tests::the_manifest_sits_next_to_the_timeline                  ok
++craftlink::tests::a_partial_render_keeps_the_extension                    ok
++craftlink::tests::an_edit_arms_the_live_link                              ok
++craftlink::tests::opening_a_document_does_not_arm_the_live_link           ok
++craftlink::tests::the_live_link_waits_for_the_quiet_period                ok
++craftlink::tests::a_new_edit_restarts_the_quiet_period                    ok
++craftlink::tests::an_unlinked_composition_is_not_rendered_by_the_live_link ok
++craftlink::tests::a_link_with_auto_sync_off_waits_for_a_save              ok
++```
++
++After a release build, copy `target/release/filmcraft.exe` and
++`target/release/effectcraft.exe` into their portable folders (keep the previous binary as
++`.exe.bak`).
++
++---
++
++## 10. Porting CraftLink to another pair of applications
++
++The feature needs only four capabilities, none of them proprietary:
++
++1. **Write an interchange timeline.** Any format both sides read (FCP7 XML here).
++2. **Write and read a sidecar JSON** next to it.
++3. **Render a composition to a movie file** both sides can decode (ProRes 4444 here).
++4. **Notice that the movie changed** (file watch, spool file, or socket).
++
++Minimum implementation:
++
++```
++send(selection):
++    seq = nest(selection)
++    xml = export(seq, FCP7)
++    write(xml)
++    write(xml.stem + ".craftlink.json", {craftlink:1, composition, xml, render, autoSync})
++    render(seq, render)
++    replace_on_timeline(selection, render)   # optional
++    open_or_notify(other_app, xml)
++
++import(xml):
++    comp = import_timeline(xml)
++    link = read(xml.stem + ".craftlink.json")
++    if link: remember(comp, link)
++
++save(project):
++    for comp in project where remembered(comp).autoSync:
++        render(comp, remembered(comp).render)
++        notify(remembered(comp).render)
++
++edit(project):                     # after any command that changed the document
++    link = remembered(active_comp)
++    if link and link.autoSync:     # saves, opens and imports are not edits
++        armed = link
++        armed.due = now + 1.0      # a new edit restarts the quiet period
++
++tick(now):                         # the frontend's frame loop, monotonic clock
++    if armed and now >= armed.due and no render running:
++        render(armed.comp, armed.render)
++        notify(armed.render)
++        armed = none
++
++notify(render):
++    write(temp/"CraftLink"/"reload-<pid>-<ms>.notify", {craftlink:1, render})
++```
++
++`remember` can be a comment field (as here), a project-level table, or a database — the format
++does not matter as long as it is saved with the project.
++
++---
++
++## 11. Known limits
++
++- **Not per-keystroke.** The master is re-rendered a second after the last edit, on *File ▸ Save*
++  (or on `file.craftlinkSync`), not for every intermediate frame of a slider drag. A per-frame
++  cache would be the next step.
++- **Whole-composition render.** EffectCraft renders the complete composition, not only the
++  changed region.
++- **Absolute paths.** Moving the project folder breaks the link until the manifest is edited.
++- **One render at a time.** An edit or save during a running CraftLink render is remembered; the
++  next tick or save picks it up.
++- **The composition that was active.** Only the linked composition that was active when the edit
++  happened is re-rendered: editing another composition that uses it as a nested precomp does not
++  update the master.
++- **Master size.** ProRes 4444 with alpha is large; keep the exchange folder on a fast disk.
++- **ProRes availability.** Both builds must include the ProRes encoder/decoder (they do).
++
++---
++
++## 12. Internationalisation
++
++Three new user-visible strings in FilmCraft — the English source plus the 16 translation
++catalogs under `crates/ui-egui/src/i18n/`:
++
++| Source (English) | Where |
++| --- | --- |
++| `Replace with EffectCraft Composition` | Clip menu, timeline context menu |
++| `Send to EffectCraft…` | Clip menu, timeline context menu |
++| `Update CraftLink Renders` | command palette / agent registry |
++
++Missing translations fall back to English, and the i18n report test always passes. The strings
++are translated in `ru.tsv`, `uk.tsv`, `de.tsv`, `es.tsv`, `fr.tsv`, `it.tsv`, `pt-br.tsv`,
++`pl.tsv`, `cs.tsv`, `sv.tsv`, `tr.tsv`, `ja.tsv`, `ko.tsv`, `zh-cn.tsv`, `id.tsv`, `bs.tsv`.
++
++---
++
++## 13. Changelog
++
++| Date | Change |
++| --- | --- |
++| 14 Nov 2026 | CraftLink: renamed from the earlier `EffectCraft` bridge; live master, manifest, spool notice, save auto-sync, `craftlink.refresh`, `file.craftlinkSync`, `file.craftlinkStatus` |
++| 14 Nov 2026 | Fixed the missing fade-out at the end of a selected clip (boundary transitions become one-sided fades) |
++| 16 Nov 2026 | Trimming applies only to a transition that lost its other side; a cross dissolve between two selected clips is copied whole |
++| 16 Nov 2026 | Menu items renamed to **Replace with EffectCraft Composition** / **Send to EffectCraft…**; the live link re-renders 1 s after the last edit, without File ▸ Save (`LiveSync`, `craftlink_tick`); FilmCraft polls the spool every 0.5 s while the project shows a link |
++| 17 Nov 2026 | The link folder is created before the first write, so the first bridge run no longer fails with `os error 3`; regression test `the_first_bridge_run_creates_its_link_folder` |
++| 14 Nov 2026 | `Session::note_media_stamp` so a render written before the first timed scan is still noticed |
++
++---
++---
++
++# CraftLink — живая связь композиций FilmCraft и EffectCraft
++
++**Статус:** реализовано, собрано, покрыто юнит-тестами (17 ноября 2026)
++**Версии:** FilmCraft 0.20.1 + EffectCraft 0.24.1 (Rust)
++**Для кого:** разработчик или ИИ-агент, которому нужно понять, поддерживать, портировать или
++заново реализовать функцию
++
++> Этот документ описывает реализацию в том виде, в каком она поставляется тремя патчами рядом
++> (`01-…filmcraft`, `02-…effectcraft`, `03-…3d-layer-styles`). Два бага, найденных при
++> тестировании, исправлены в этих патчах и покрыты регресс-тестами: пропадающий fade-out на
++> границе выделения и падение первого запуска моста с `os error 3` из-за отсутствующей папки
++> ссылки. Оба описаны в `REPORT.md` §1.7 и §1.9.
++
++---
++
++## 0. Заявление о чистой комнате
++
++CraftLink написан исходя из обычного поведения двух приложений и **только по открытым,
++публично задокументированным форматам**:
++
++| Назначение | Формат | Спецификация |
++| --- | --- | --- |
++| Обмен таймлайном | Final Cut Pro 7 XML (`<xmeml version="4">`) | открытый, широко описанный формат обмена |
++| Связанный мастер | Apple ProRes 4444 в QuickTime, RGBA + PCM | открыто описанные кодек и контейнер |
++| Боковые метаданные | JSON (RFC 8259) | публичный стандарт |
++| Уведомление | файл во временной папке + JSON Lines по loopback | публичный стандарт |
++
++Не использовались проприетарный формат проекта, закрытый протокол, разделяемая библиотека,
++дизассемблированный бинарник, документация производителя, таблицы строк или интерфейс
++стороннего продукта. Функция **не является** реализацией какого-либо коммерческого продукта
++«динамической связи» и не связана с ним. Имена, структура модулей, идентификаторы и формат
++сообщений ниже — оригинальные для этого проекта. CraftLink можно полностью воспроизвести по
++этому документу.
++
++---
++
++## 1. Что делает CraftLink
++
++1. Редактор выделяет один или несколько эпизодов (клипов) на таймлайне FilmCraft и вызывает
++   контекстное меню.
++2. **Replace with EffectCraft Composition** заменяет выделение связанным мастер-клипом и
++   открывает выделение как композицию в EffectCraft.
++   **Send to EffectCraft** делает то же самое, не меняя таймлайн FilmCraft.
++3. Редактор работает в EffectCraft (добавляет Glow, маски, анимацию…).
++4. Примерно через секунду после последней правки — или сразу по **File ▸ Save** — EffectCraft
++   рендерит композицию поверх того же мастер-файла. Сохранять проект не обязательно: связь
++   следует за правками.
++5. FilmCraft замечает изменение и перечитывает мастер — таймлайн показывает правку.
++
++Связанный мастер — реальный файл на диске, поэтому связь переживает перезапуск, а любое из
++приложений можно закрыть и открыть без потери связи.
++
++---
++
++## 2. Архитектура
++
++```
++Таймлайн FilmCraft
++  выделение
++     │
++     ▼
++nest_selection_for_bridge ──► вложенная последовательность (клипы сдвинуты к тику 0)
++     │
++     ├─ materialize_generators_for_export ──► процедурные демо запекаются в MP4
++     ├─ экспорт FCP7 XML  ──────────────────► <имя>.xml
++     ├─ write_manifest    ──────────────────► <имя>.craftlink.json
++     └─ bake_linked_master ─────────────────► CraftLink/<имя>.mov  (ProRes 4444 + альфа + PCM)
++     │
++     ▼
++link_placed_clips_to_master ──► клипы таймлайна теперь указывают на <имя>.mov
++     │
++     ▼
++launch_or_notify_effectcraft ──► effectcraft.exe <имя>.xml
++                                  (или loopback file.importTimeline, если он уже запущен)
++     │
++     ▼
++EffectCraft: file.importTimeline
++     ├─ импорт XML в композицию
++     └─ register_import: Item.comment = "craftlink:{...}"   (переживает перезагрузку проекта)
++     │
++     ▼
++редактор меняет композицию
++     │
++     ▼
++через 1 с после последней правки (craftlink_tick) или по File ▸ Save (auto_sync)
++     ├─ render_comp ──► <имя>.partial.mov ──► переименование поверх <имя>.mov
++     ├─ spool: %TEMP%\CraftLink\reload-<pid>-<ms>.notify
++     └─ необязательный loopback: engine.execute "craftlink.refresh"
++     │
++     ▼
++FilmCraft tick_media_refresh видит уведомление (опрос каждые 0.5 с, пока в проекте есть связь)
++     └─ start_media_scan ──► apply_media_stamps ──► перечитывание <имя>.mov
++     │
++     ▼
++таймлайн показывает правку из EffectCraft
++```
++
++Два независимых пути уведомления сделаны намеренно: spool-файлу не нужны сокет, токен и порт,
++он работает даже если FilmCraft запущен без `--control`; loopback-запрос — лишь необязательное
++ускорение.
++
++---
++
++## 3. Форматы данных
++
++### 3.1 Таймлайн обмена — Final Cut Pro 7 XML
++
++Пишется FilmCraft через
++`filmcraft_interchange::export(&project, sequence, Format::Fcp7Xml, &options)`.
++Читается EffectCraft через `effectcraft_interchange::import`, который разбирает файл через
++`filmcraft_interchange::import_with`.
++
++Используются только элементы, которые оба приложения уже поддерживают: `sequence`,
++`media/video`, `media/audio`, `track`, `clipitem`, `file`, `transitionitem`, `filter`
++(Basic Motion, Opacity, Audio Levels, Audio Pan), маркеры. В XML не добавляется ничего
++специфичного для CraftLink, поэтому файл остаётся читаемым любым потребителем FCP7 XML.
++
++### 3.2 Боковой манифест — `<имя>.craftlink.json`
++
++Пишется рядом с XML в FilmCraft (`write_manifest`), читается в EffectCraft
++(`source_for_timeline`).
++
++```json
++{
++  "craftlink": 1,
++  "composition": "CraftLink Comp 01",
++  "xml": "C:\\Проекты\\Демо\\CraftLink Comp 01.xml",
++  "render": "C:\\Проекты\\Демо\\CraftLink\\CraftLink Comp 01.mov",
++  "autoSync": true,
++  "application": "FilmCraft"
++}
++```
++
++| Поле | Тип | Смысл |
++| --- | --- | --- |
++| `craftlink` | целое | версия манифеста, сейчас `1` |
++| `composition` | строка | имя композиции в FilmCraft |
++| `xml` | строка | абсолютный путь к файлу обмена |
++| `render` | строка | абсолютный путь к связанному мастеру |
++| `autoSync` | bool | держать мастер в синхронизации автоматически: рендер через секунду после правки и при каждом сохранении (по умолчанию `true`) |
++| `application` | строка | кто создал связь (`"FilmCraft"`) |
++
++Манифест необязателен: обычный импорт XML без него ведёт себя как всегда и связи не создаёт.
++
++### 3.3 Хранение связи внутри EffectCraft — `Item.comment`
++
++В EffectCraft нет поля для внешних связей, поэтому манифест хранится в существующем поле
++комментария элемента композиции, одной строкой, с префиксом `craftlink:`:
++
++```
++craftlink:{"craftlink":1,"composition":"CraftLink Comp 01","xml":"…","render":"…","autoSync":true,"application":"FilmCraft"}
++```
++
++Это **не требует** изменения схемы проекта и сохраняется вместе с ним. Комментарий, не
++начинающийся с `craftlink:`, связью никогда не считается.
++
++Код: `CraftLinkSource::to_comment` / `CraftLinkSource::from_comment`.
++
++### 3.4 Уведомление — `%TEMP%\CraftLink\reload-<pid>-<ms>.notify`
++
++- **Пишет:** EffectCraft после успешного рендера (`notify_filmcraft`).
++- **Содержимое:** `{"craftlink":1,"render":"C:\\…\\<имя>.mov"}`.
++- **Читает:** FilmCraft каждый кадр, пока открыто окно
++  (`crates/ui-egui/src/app/frame.rs`, `craftlink_notify_pending` / `craftlink_clear_notices`).
++- **Время жизни:** файл поглощается, как только начинается сканирование; файлы старше
++  10 минут удаляет писатель, поэтому упавший получатель не оставляет мусора.
++
++Получатель не разбирает путь: ему достаточно знать, что что-то изменилось, — обычный
++наблюдатель медиа заново снимет штампы и перечитает все файлы проекта.
++
++### 3.5 Необязательный loopback-запрос
++
++Если в окружении есть `FILMCRAFT_CONTROL_TOKEN` (64 hex-символа; переменная наследуется
++процессом EffectCraft, который запустил FilmCraft), EffectCraft дополнительно отправляет одну
++JSON-строку в control-сервер FilmCraft:
++
++```json
++{"token":"<64 hex>","method":"engine.execute","params":{"command":"craftlink.refresh","params":{}}}
++```
++
++Порты: `filmcraft_control.json` (рабочая папка и временная папка, поле `port`), затем `9876`.
++Без токена FilmCraft держит слушатель закрытым, поэтому этот путь необязателен.
++
++---
++
++## 4. Изменения в FilmCraft
++
++### 4.1 Файлы
++
++| Файл | Изменение |
++| --- | --- |
++| `crates/engine/src/craftlink_bridge.rs` | **новый** — вся сторона FilmCraft |
++| `crates/engine/src/craftlink_bridge_tests.rs` | **новый** — 6 юнит-тестов |
++| `crates/engine/src/lib.rs` | регистрация модуля (`pub mod craftlink_bridge`, тестовый модуль под `#[cfg(test)]`) |
++| `crates/engine/src/commands.rs` | 3 команды |
++| `crates/engine/src/clip_ops.rs` | порядок в контекстном меню |
++| `crates/engine/src/media_watch.rs` | `Session::note_media_stamp`, `watches_linked_master` |
++| `crates/ui-egui/src/app/frame.rs` | опрос spool-файлов в `tick_media_refresh` (каждые 0.5 с, пока показана связь), после существующей проверки `has_media_files` |
++| `crates/ui-egui/src/panels/timeline/menus.rs` | две подписи контекстного меню |
++| `crates/ui-egui/src/i18n/*.tsv` | 3 строки × 16 каталогов |
++| `apps/filmcraft/src/main.rs` | убрано консольное окно у релизных сборок (`windows_subsystem`, больше не под `debug_assertions`) |
++
++### 4.2 Функции (`crates/engine/src/craftlink_bridge.rs`)
++
++| Функция | Ответственность |
++| --- | --- |
++| `next_craftlink_comp_name(s)` | первое свободное имя `CraftLink Comp NN` |
++| `link_folder(s)` | `<папка проекта>/CraftLink` или `%TEMP%/CraftLink` для несохранённого проекта |
++| `master_path(s, name)` | `<link_folder>/<имя>.mov` |
++| `manifest_path(xml)` | `<stem>.craftlink.json` рядом с XML |
++| `nest_selection_for_bridge(s, name, replace)` | строит вложенную последовательность из выделения, сдвигает к тику 0, копирует переходы, обрезает граничные переходы (см. §6), при необходимости заменяет выделение на активном таймлайне |
++| `bake_demo_scene(scene, duration)` | рендерит один процедурный демо-генератор в настоящий H.264 MP4 |
++| `materialize_generators_for_export(s, nid)` | заменяет генераторы во вложенной последовательности этими MP4 |
++| `bake_linked_master(s, nid, path, duration)` | рендерит последовательность в ProRes 4444 с альфой и звуком |
++| `write_manifest(s, xml, master, name, auto_sync)` | пишет боковой JSON |
++| `link_placed_clips_to_master(s, placed, name, master)` | добавляет медиа-элемент мастера, перенаправляет на него клипы и фиксирует штамп |
++| `execute_bridge(s, p, replace)` | оркестрация обеих команд отправки |
++| `refresh_linked(s, p)` | `craftlink.refresh` — `media_watch::refresh_changed` + уведомление |
++| `launch_or_notify_effectcraft(xml)` | сначала loopback, затем запуск `effectcraft.exe`, иначе `saved_only` |
++| `find_effectcraft_exe()` | `EFFECTCRAFT_PATH`, рядом с exe, `../EffectCraft/`, `../../EffectCraft/`, `Program Files`, `PATH` |
++
++### 4.3 Команды
++
++| Команда | Меню | Параметры | Результат |
++| --- | --- | --- | --- |
++| `clip.replaceWithCraftLink` | Clip | `{name?, path?, autoSync?, launch?}` | `{sequence, clips, path, name, start, duration, effectcraft, craftlink, replaced:true}` |
++| `clip.sendToCraftLink` | Clip | `{name?, path?, autoSync?, launch?}` | то же, `replaced:false` |
++| `craftlink.refresh` | — | `{}` | результат `media.refreshChanged` |
++
++`launch:false` не запускает EffectCraft (тесты, агенты); `autoSync:false` запрещает EffectCraft
++перерендеривать мастер при сохранении для этой связи.
++
++Объект `craftlink` в результате:
++
++```json
++{"linked": true, "render": "…\\CraftLink\\CraftLink Comp 01.mov", "autoSync": true}
++```
++
++`linked` равно `false`, если мастер не удалось прочитать обратно (тогда на таймлайне остаётся
++вложенная композиция, которая рендерит то же содержимое), а `error` объясняет причину.
++
++### 4.4 Дополнение наблюдателя медиа
++
++`Session::note_media_stamp(path)` запоминает текущие размер и время изменения файла как
++базовый штамп. Вызывается сразу после вставки связанного мастера, потому что наблюдатель
++намеренно считает `None → Some` «не изменилось» (файл, которого не было при прошлом взгляде,
++не считается изменившимся). Без этой базовой отметки сохранение в EffectCraft, случившееся до
++первого планового сканирования FilmCraft, было бы пропущено.
++
++### 4.5 Интерфейс
++
++- Контекстное меню клипа таймлайна: **Replace with EffectCraft Composition**, **Send to EffectCraft**.
++- Меню Clip: те же команды.
++- `tick_media_refresh` запускает сканирование сразу, как только появился файл `.notify`, даже
++  если *Automatically refresh growing files* выключено.
++- Проект, показывающий связанный мастер (`media_watch::watches_linked_master`: медиафайл внутри
++  папки `CraftLink`), опрашивает spool-папку каждые 0.5 с: живой рендер виден сразу, а не через
++  минуту, на следующем плановом сканировании. Плановое сканирование по-прежнему подчиняется
++  *Automatically refresh growing files*, а уведомление CraftLink — нет.
++
++---
++
++## 5. Изменения в EffectCraft
++
++### 5.1 Файлы
++
++| Файл | Изменение |
++| --- | --- |
++| `crates/engine/src/craftlink.rs` | **новый** — манифест, хранение в комментарии, синхронизация, живая связь, уведомление |
++| `crates/engine/src/cmd/timeline.rs` | `prerender_cx`, `render_comp`, регистрация при импорте, 3 команды (`file.sendToFilmCraft`, `file.craftlinkSync`, `file.craftlinkStatus`) |
++| `crates/engine/src/cmd.rs` | `pub(crate) mod timeline` |
++| `crates/engine/src/cmd/file.rs` | `auto_sync` после `save` / `saveAs` |
++| `crates/engine/src/lib.rs` | `mod craftlink`, `pub use craftlink::LiveSync`, `Session::craftlink_live` |
++| `crates/engine/src/session/dispatch.rs` | `craftlink_note_change` после команды, изменившей `revision` |
++| `crates/ui-egui/src/app/frame.rs` | `craftlink_tick(self.now)` в логическом тике |
++| `crates/engine/src/menus.rs` | пункты File ▸ Export |
++| `crates/engine/src/tests/timeline_interchange.rs` | тест `send_to_filmcraft_exports_xml` |
++| `apps/effectcraft/src/main.rs` | файл таймлайна (`.xml`/`.fcpxml`/`.otio`/`.edl`/`.aaf`/`.omf`), переданный в командной строке, открывается как таймлайн; убрано консольное окно |
++
++### 5.2 Функции (`crates/engine/src/craftlink.rs`)
++
++| Функция | Ответственность |
++| --- | --- |
++| `CraftLinkSource::from_value / to_value` | манифест ⇄ структура |
++| `CraftLinkSource::to_comment / from_comment` | хранение в `Item.comment` |
++| `manifest_path(xml)` | путь бокового файла |
++| `source_for_timeline(xml)` | чтение бокового файла |
++| `source_of(s, cid)` | чтение связи из комментария композиции |
++| `partial_path(render)` | `foo.mov` → `foo.partial.mov` |
++| `notify_filmcraft(render)` | spool-файл + очистка + необязательный loopback |
++| `notify_filmcraft_control()` | аутентифицированный JSON-lines запрос |
++| `spawn_render(s, cid, src, wait, quiet)` | рендер в `.partial.mov`, переименование поверх мастера, уведомление |
++| `sync(s, p)` | `file.craftlinkSync` |
++| `status(s, p)` | `file.craftlinkStatus` |
++| `auto_sync(s)` | перерендер всех связей с `autoSync` после сохранения |
++| `craftlink_note_change(id)` | взвести живую связь после правки (сохранения, открытия и импорт пропускаются) |
++| `craftlink_tick(now)` | рендер взведённой связи, когда период тишины истёк |
++| `craftlink_live_pending()` | ждёт ли живой рендер (подсказка перерисовки для интерфейса) |
++| `register_import(project, comps, xml)` | запись комментария при импорте |
++
++### 5.3 Рендер всей композиции (`crates/engine/src/cmd/timeline.rs`)
++
++`render_comp(cx, project, cid, path, progress)` собирает один `RenderQueueItem`:
++
++```
++time_span      = TimeSpan::LengthOfComp
++output.format  = OutputFormat::ProRes
++channels       = Channels::Rgba
++prores_profile = ProResProfile::P4444
++audio          = AudioOutput::Auto
++output.output  = path
++```
++
++и отдаёт его `Exporter` сессии. `prerender_cx(s)` собирает кодировщик, источник футажа, хост
++выражений, GPU-ускоритель и настройку *Switches Affect Nested Comps* — так же, как экспорт
++таймлайна, поэтому фоновый рендер видит тот же проект, что и интерфейс.
++
++### 5.4 Команды
++
++| Команда | Меню | Параметры | Результат |
++| --- | --- | --- | --- |
++| `file.craftlinkSync` | File ▸ Export ▸ Update CraftLink Render | `{comp?, background?}` | `{comp, render, xml}` (или `{job}` при `background:true`) |
++| `file.craftlinkStatus` | — | `{comp?}` | `{linked, composition, xml, render, autoSync, application, exists, bytes, modified}` |
++| `file.sendToFilmCraft` | File ▸ Export ▸ Send to FilmCraft… | `{comp?, path?}` | `{comp, name, path, export, filmcraft}` — `filmcraft.status` равен `connected_to_control_server`, `launched`, `launch_failed` или `saved_only` |
++
++`file.sendToFilmCraft` — обратное направление: экспортирует активную композицию в XML Final Cut Pro,
++затем отдаёт файл работающему FilmCraft по control-каналу (`engine.execute` → `file.import`), либо
++запускает `filmcraft.exe` на этом файле, либо оставляет `.xml` на диске (`saved_only`).
++`find_filmcraft_exe` проверяет `FILMCRAFT_PATH`, файл рядом с exe, `../FilmCraft/`, `../../FilmCraft/`,
++`Program Files` и `PATH` — в этом порядке.
++
++### 5.5 Хук сохранения
++
++`crates/engine/src/cmd/file.rs`:
++
++```rust
++fn save(s, p)    { let r = save_to(s, &path)?; crate::craftlink::auto_sync(s); Ok(r) }
++fn save_as(s, p) { let r = save_to(s, path)?;  crate::craftlink::auto_sync(s); Ok(r) }
++```
++
++Сам `save_to` **не** перехватывается, поэтому автосохранение, *Increment and Save* и
++восстановление не запускают рендеры. `auto_sync` пропускает запуск, если задача `craftlink`
++уже выполняется (один рендер за раз), и учитывает только связи с `autoSync = true`.
++
++### 5.6 Живая связь (без сохранения)
++
++Мастер следует за правками без File ▸ Save:
++
++| Часть | Где | Что делает |
++| --- | --- | --- |
++| `Session::craftlink_live: LiveSync` | `lib.rs`, `craftlink.rs` | `{dirty, since, seen, comp, rendered}` — состояние дребезга (debounce) |
++| `craftlink_note_change(id)` | `session/dispatch.rs` | после любой команды, изменившей `revision`: взводит связь для активной тогда композиции; сохранения, открытия, revert и импорт только помечают ревизию увиденной |
++| `craftlink_tick(now)` | `ui-egui/src/app/frame.rs` | когда правок нет `LIVE_DELAY` (1.0 с), запускает один тихий `spawn_render` |
++| `craftlink_live_pending()` | `ui-egui/src/app/frame.rs` | держит перерисовку каждые 120 мс, пока рендер должен быть |
++| `watches_linked_master(project)` | FilmCraft `media_watch.rs` | проект с медиафайлом в папке `CraftLink` опрашивает spool каждые 0.5 с |
++
++Правила:
++
++- Рендерится только композиция, **активная** в момент правки; переключение композиций посреди
++  правки не рендерит другую.
++- Один рендер за раз: правка во время рендера запоминается и рендерится после него, а не
++  ставится в очередь стопкой.
++- `autoSync: false` выключает и живую связь: такую связь рендерят только `file.craftlinkSync` и
++  *File ▸ Save*.
++- Живой рендер тихий (без тоста); сообщают только явная синхронизация и сохранения.
++- У движка нет часов, поэтому дребезг считает интерфейс по своим монотонным `AppClock::now()` и
++  передаёт время в `craftlink_tick`.
++
++---
++
++## 6. Исправление пропавшего затемнения (fade-out)
++
++### Симптом
++
++После отправки выделения в EffectCraft у **последнего выбранного клипа** пропадало затемнение
++(fade-out) в EffectCraft (прислан скриншот).
++
++### Причина
++
++Переход может пересекать границу выделения: его исходящая сторона выбрана, входящая — нет.
++Старый мост копировал переход только если выбраны **обе** стороны, поэтому граничный переход
++терялся, и клип лишался затемнения.
++
++### Исправление
++
++`nest_selection_for_bridge` теперь сохраняет каждый переход, у которого хотя бы одна сторона в
++выделении, а отсутствующую сторону делает «чёрной»:
++
++| Исходно | Выделение | Результат |
++| --- | --- | --- |
++| `from = A`, `to = B` | только A | `from = A`, `to = None` → `end-black` (затемнение) |
++| `from = A`, `to = B` | только B | `from = None`, `to = B` → `start-black` (появление) |
++| `from = None`, `to = B` | B | без изменений → `start-black` |
++| `from = A`, `to = None` | A | без изменений → `end-black` |
++| обе стороны вне выделения | — | отбрасывается |
++| обе стороны стали `None` | — | отбрасывается |
++
++Затем переход **обрезается до границ выбранного клипа** — но только если он действительно
++потерял вторую сторону; переход, у которого обе стороны в выделении (кросс-диссолв между двумя
++выбранными клипами), копируется целиком:
++
++- затемнение (`from` выбран): `end = min(transition.end, clip.end)`,
++  `duration = end - start`;
++- появление (`to` выбран): `start = max(transition.start, clip.start)`,
++  `duration = end - start`.
++
++Писатель FCP7 выводит `start-black` / `end-black` из пары `(from, to)` (`write_transition`,
++`crates/interchange/src/fcp7.rs`). Импортёр EffectCraft уже превращает их в ключи прозрачности
++(`crates/interchange/src/import.rs`):
++
++```rust
++if tr.to == Some(clip)          { fades.push((start, end, 0.0, 1.0)); } // появление
++if tr.from == Some(clip) && tr.to.is_none() { fades.push((start, end, 1.0, 0.0)); } // затемнение
++```
++
++Благодаря обрезке затемнение теперь покрывает последние кадры клипа, а не уходит за его конец.
++
++Регрессионный тест: `boundary_transition_becomes_a_one_sided_fade` и
++`a_cross_dissolve_between_two_selected_clips_keeps_both_sides`
++(`crates/engine/src/craftlink_bridge_tests.rs`).
++
++---
++
++## 7. Последовательность живой синхронизации
++
++1. **FilmCraft** — редактор выделяет клипы, вызывает `clip.replaceWithCraftLink`.
++2. `nest_selection_for_bridge` создаёт вложенную последовательность (а для *replace* заменяет
++   выделение клипом вложенной последовательности).
++3. `materialize_generators_for_export` запекает процедурные демо-генераторы в MP4 (в EffectCraft
++   нет генераторов FilmCraft).
++4. `filmcraft_interchange::export` пишет `<имя>.xml`.
++5. `bake_linked_master` рендерит `CraftLink/<имя>.mov` (ProRes 4444 + альфа + PCM), а
++   `write_manifest` пишет `<имя>.craftlink.json`.
++6. `link_placed_clips_to_master` добавляет медиа-элемент мастера, перенаправляет на него клипы
++   и запоминает штамп.
++7. `launch_or_notify_effectcraft` просит запущенный EffectCraft импортировать XML (loopback) или
++   запускает `effectcraft.exe <xml>`.
++8. **EffectCraft** — `file.importTimeline` импортирует XML, затем `register_import` пишет
++   `craftlink:{…}` в комментарий композиции.
++9. Редактор добавляет эффекты (Glow, маски…) и сохраняет.
++10. `auto_sync` → `spawn_render` → `render_comp` пишет `<имя>.partial.mov`, переименовывает
++    поверх `<имя>.mov`, затем `notify_filmcraft` пишет spool-уведомление.
++11. **FilmCraft** — `tick_media_refresh` замечает уведомление, запускает сканирование, оно
++    перечитывает изменённый мастер, таймлайн перерисовывается с новым рендером.
++
++Задержка: время рендера (всей композиции) плюс один кадр интерфейса. Потоковой передачи по
++кадрам нет.
++
++---
++
++## 8. Настройки и значения по умолчанию
++
++| Настройка | Где | По умолчанию |
++| --- | --- | --- |
++| *Automatically refresh growing files* | FilmCraft ▸ Settings ▸ Media | включено |
++| *Refresh growing files every* | FilmCraft ▸ Settings ▸ Media | 60 с |
++| `autoSync` | параметр команды / манифест | `true` |
++| `launch` | параметр команды | `true` |
++
++Уведомление CraftLink запускает сканирование даже при выключенном автообновлении.
++
++---
++
++## 9. Сборка и тесты
++
++Проект собирается инструментарием `stable-x86_64-pc-windows-gnullvm` (без MSVC `link.exe`).
++
++```powershell
++# FilmCraft
++cd filmcraft-0.20.1
++cargo build --release -p filmcraft
++cargo test -p filmcraft-engine craftlink
++
++# EffectCraft
++cd effectcraft-0.24.1
++cargo build --release -p effectcraft
++cargo test -p effectcraft-engine craftlink
++cargo test -p effectcraft-engine menus::tests
++```
++
++Ожидаемые тесты CraftLink:
++
++```
++craftlink_bridge_tests::craftlink_fails_when_no_clips_selected            ok
++craftlink_bridge_tests::replace_with_craftlink_creates_xml_and_replaces_on_timeline   ok
++craftlink_bridge_tests::send_to_craftlink_keeps_original_timeline         ok
++craftlink_bridge_tests::boundary_transition_becomes_a_one_sided_fade      ok
++craftlink_bridge_tests::a_cross_dissolve_between_two_selected_clips_keeps_both_sides ok
++craftlink_bridge_tests::the_first_bridge_run_creates_its_link_folder         ok
++craftlink::tests::a_manifest_round_trips_through_a_comment                ok
++craftlink::tests::a_plain_comment_is_not_a_link                           ok
++craftlink::tests::the_manifest_sits_next_to_the_timeline                  ok
++craftlink::tests::a_partial_render_keeps_the_extension                    ok
++craftlink::tests::an_edit_arms_the_live_link                              ok
++craftlink::tests::opening_a_document_does_not_arm_the_live_link           ok
++craftlink::tests::the_live_link_waits_for_the_quiet_period                ok
++craftlink::tests::a_new_edit_restarts_the_quiet_period                    ok
++craftlink::tests::an_unlinked_composition_is_not_rendered_by_the_live_link ok
++craftlink::tests::a_link_with_auto_sync_off_waits_for_a_save              ok
++```
++
++После релизной сборки скопируйте `target/release/filmcraft.exe` и
++`target/release/effectcraft.exe` в их portable-папки (предыдущий бинарник сохраните как
++`.exe.bak`).
++
++---
++
++## 10. Перенос CraftLink на другую пару приложений
++
++Функции нужны всего четыре возможности, и ни одна не является проприетарной:
++
++1. **Писать таймлайн обмена.** Любой формат, который читают обе стороны (здесь FCP7 XML).
++2. **Писать и читать боковой JSON** рядом с ним.
++3. **Рендерить композицию в видеофайл**, который декодируют обе стороны (здесь ProRes 4444).
++4. **Замечать изменение файла** (наблюдатель, spool-файл или сокет).
++
++Минимальная реализация:
++
++```
++send(selection):
++    seq = nest(selection)
++    xml = export(seq, FCP7)
++    write(xml)
++    write(xml.stem + ".craftlink.json", {craftlink:1, composition, xml, render, autoSync})
++    render(seq, render)
++    replace_on_timeline(selection, render)   # необязательно
++    open_or_notify(other_app, xml)
++
++import(xml):
++    comp = import_timeline(xml)
++    link = read(xml.stem + ".craftlink.json")
++    if link: remember(comp, link)
++
++save(project):
++    for comp in project where remembered(comp).autoSync:
++        render(comp, remembered(comp).render)
++        notify(remembered(comp).render)
++
++edit(project):                     # after any command that changed the document
++    link = remembered(active_comp)
++    if link and link.autoSync:     # saves, opens and imports are not edits
++        armed = link
++        armed.due = now + 1.0      # a new edit restarts the quiet period
++
++tick(now):                         # the frontend's frame loop, monotonic clock
++    if armed and now >= armed.due and no render running:
++        render(armed.comp, armed.render)
++        notify(armed.render)
++        armed = none
++
++notify(render):
++    write(temp/"CraftLink"/"reload-<pid>-<ms>.notify", {craftlink:1, render})
++```
++
++`remember` может быть полем комментария (как здесь), таблицей проекта или базой данных —
++формат не важен, пока он сохраняется вместе с проектом.
++
++---
++
++## 11. Известные ограничения
++
++- **Не по каждому нажатию.** Мастер перерендеривается через секунду после последней правки, по
++  *File ▸ Save* (или `file.craftlinkSync`), а не на каждый промежуточный кадр движения
++  ползунка. Следующий шаг — кеш по кадрам.
++- **Рендер всей композиции.** EffectCraft рендерит композицию целиком, а не только изменённую
++  область.
++- **Абсолютные пути.** Перенос папки проекта разрывает связь, пока не отредактирован манифест.
++- **Один рендер за раз.** Правка или сохранение во время идущего рендера CraftLink запоминается;
++  его подхватит следующий тик или сохранение.
++- **Только активная композиция.** Перерендеривается лишь та связанная композиция, что была
++  активна в момент правки: правка другой композиции, использующей её как вложенный прекомп, мастер
++  не обновляет.
++- **Размер мастера.** ProRes 4444 с альфой занимает много места; папку обмена лучше держать на
++  быстром диске.
++- **Наличие ProRes.** Обе сборки должны включать кодировщик/декодировщик ProRes (включают).
++
++---
++
++## 12. Локализация
++
++Три новые строки интерфейса FilmCraft — английский источник и 16 каталогов переводов в
++`crates/ui-egui/src/i18n/`:
++
++| Исходная строка (английский) | Где |
++| --- | --- |
++| `Replace with EffectCraft Composition` | меню Clip, контекстное меню таймлайна |
++| `Send to EffectCraft…` | меню Clip, контекстное меню таймлайна |
++| `Update CraftLink Renders` | палитра команд / реестр агента |
++
++Отсутствующие переводы показываются по-английски, отчёт i18n всегда проходит. Строки
++переведены в `ru.tsv`, `uk.tsv`, `de.tsv`, `es.tsv`, `fr.tsv`, `it.tsv`, `pt-br.tsv`,
++`pl.tsv`, `cs.tsv`, `sv.tsv`, `tr.tsv`, `ja.tsv`, `ko.tsv`, `zh-cn.tsv`, `id.tsv`, `bs.tsv`.
++
++---
++
++## 13. История изменений
++
++| Дата | Изменение |
++| --- | --- |
++| 14.11.2026 | CraftLink: переименован из прежнего моста `EffectCraft`; живой мастер, манифест, spool-уведомление, автосинхронизация при сохранении, `craftlink.refresh`, `file.craftlinkSync`, `file.craftlinkStatus` |
++| 14.11.2026 | Исправлено пропавшее затемнение в конце выбранного клипа (граничные переходы становятся односторонними затемнениями) |
++| 14.11.2026 | `Session::note_media_stamp`, чтобы рендер, записанный до первого планового сканирования, всё равно замечался |
++| 16.11.2026 | Обрезка применяется только к переходу, потерявшему вторую сторону; кросс-диссолв между двумя выбранными клипами копируется целиком |
++| 16.11.2026 | Пункты меню переименованы в **Replace with EffectCraft Composition** / **Send to EffectCraft…**; живая связь рендерит через 1 с после последней правки, без File ▸ Save (`LiveSync`, `craftlink_tick`); FilmCraft опрашивает spool каждые 0.5 с, пока в проекте есть связь |
++| 17.11.2026 | Папка связи создаётся до первой записи, поэтому первый запуск моста больше не падает с `os error 3`; регрессионный тест `the_first_bridge_run_creates_its_link_folder` |
+--- /dev/null
++++ b/DYNAMIC_LINK_INTEGRATION.md
+@@ -0,0 +1,155 @@
++# FilmCraft ↔ EffectCraft Dynamic Link & Timeline Interoperability
++
++> ⚠️ **УСТАРЕЛО / DEPRECATED.** Этот документ описывает первую версию моста и содержит
++> идентификаторы команд, которых больше нет (`clip.replaceWithEffectCraft`,
++> `clip.sendToEffectCraft`, порт `9877`). Актуальная реализация — **CraftLink**; её описание,
++> форматы обмена, таблицы файлов/функций/команд и порядок сборки находятся в
++> [`CRAFTLINK_ARCHITECTURE.md`](CRAFTLINK_ARCHITECTURE.md). Ниже документ сохранён только как
++> история.
++>
++> ⚠️ **DEPRECATED.** This file describes the first version of the bridge and names command IDs
++> that no longer exist (`clip.replaceWithEffectCraft`, `clip.sendToEffectCraft`, port `9877`).
++> The current implementation is **CraftLink**; see
++> [`CRAFTLINK_ARCHITECTURE.md`](CRAFTLINK_ARCHITECTURE.md) for its architecture, interchange
++> formats, file/function/command tables and build steps. The text below is kept for history only.
++
++> **Документация для разработчиков и языковых моделей (LLM)**  
++> **Дата обновления:** 14 ноября 2026 г.  
++> **Статус:** Реализовано, протестировано, исправлены замечания по консоли и серому фону, скомпилировано в оптимизированные `--release` бинарники.
++
++---
++
++## 1. Обзор архитектуры (Executive Summary)
++
++Реализован механизм межпрограммного взаимодействия (Dynamic Link / Timeline Interchange) между видеоредактором **FilmCraft** (аналог Adobe Premiere Pro) и средой композитинга и визуальных эффектов **EffectCraft** (аналог Adobe After Effects). Обе программы разработаны на чистом Rust.
++
++### Основные возможности:
++1. **Выделение клипов на таймлайне FilmCraft:**
++   - Пользователь выделяет один или несколько эпизодов/клипов на таймлайне FilmCraft (видео и аудио дорожки).
++   - По правому клику мыши (контекстное меню клипа) или через меню `Clip` доступны команды:
++     - **«Replace with EffectCraft Composition»** (`clip.replaceWithEffectCraft`) — заменяет выделенные клипы на таймлайне FilmCraft вложенным клипом-композицией (Nest) и передает исходные клипы со всеми таймкодами, свойствами и дорожками в EffectCraft.
++     - **«Send to EffectCraft…»** (`clip.sendToEffectCraft`) — неразрушающий экспорт выделенных клипов в проект EffectCraft без изменения текущего таймлайна FilmCraft.
++2. **Автоматическая передача и открытие в EffectCraft:**
++   - Выделенные эпизоды нормализуются по времени (смещение к тику 0) и экспортируются в индустриальный формат обмена **Final Cut Pro 7 XML** (`<xmeml>`).
++   - Механизм IPC автоматически проверяет, запущен ли EffectCraft с активным локальным каналом управления (JSON-lines TCP на `127.0.0.1:9877` или по порту из `effectcraft_control.json`).
++   - Если EffectCraft запущен — команда `file.importTimeline` отправляется по сети мгновенно, и композиция открывается без перезапуска программы.
++   - Если EffectCraft закрыт — запускается процесс `effectcraft.exe <path_to_xml>`.
++3. **Прямое открытие XML таймлайнов в EffectCraft:**
++   - EffectCraft CLI и GUI автоматически распознают переданные файлы таймлайнов (`.xml`, `.otio`, `.edl`, `.fcpxml`, `.aaf`, `.omf`) как на этапе старта программы, так и при вызове `file.import` (включая Drag-and-Drop).
++4. **Обратная связь (EffectCraft → FilmCraft):**
++   - В EffectCraft добавлена команда `file.sendToFilmCraft`, позволяющая отправить активную композицию обратно в FilmCraft через предрендер (ProRes 4444 с альфа-каналом) и XML таймлайн.
++
++---
++
++## 2. Разбор и устранение обнаруженных проблем
++
++### Проблема 1: Открывающееся окно консоли (Terminal / Console Window)
++* **Причина:**  
++  В Windows подсистема бинарного файла задается PE-заголовком `Subsystem`. При сборке в dev-режиме (`cargo build` без `--release`) действовал атрибут `not(debug_assertions)` в `#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]`, из-за чего PE-заголовок имел значение `CONSOLE` (3) вместо `WINDOWS` (2). При старте процесса Windows выделяла черное консольное окно для stdout/stderr. Также дочерний процесс при обычном `spawn()` наследовал консоль.
++* **Исправление:**
++  1. В `apps/filmcraft/src/main.rs` и `apps/effectcraft/src/main.rs` директива изменена на безусловную:
++     ```rust
++     #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
++     ```
++  2. При порождении процесса в `crates/engine/src/effectcraft_bridge.rs` добавлены флаги создания Windows-процесса:
++     ```rust
++     #[cfg(windows)]
++     {
++         use std::os::windows::process::CommandExt;
++         const CREATE_NO_WINDOW: u32 = 0x08000000;
++         const DETACHED_PROCESS: u32 = 0x00000008;
++         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
++     }
++     ```
++  3. Обе программы скомпилированы в профиле `--release`. Консольное окно полностью отключено на уровне ОС.
++
++---
++
++### Проблема 2: Серый фон в окне просмотра EffectCraft
++* **Причина:**  
++  Встроенный демонстрационный проект FilmCraft (`Misty_Forest.mp4` и `Neon_Loop.mov`) использует процедурные шейдерные генераторы `filmcraft_media::Generator::Demo(...)` вместо физических видеофайлов на жестком диске.  
++  При выгрузке в FCP7 XML они сериализовались в `<generatoritem>` с метаданными `<effectid>filmcraft:{"Demo":"Forest"}</effectid>`.  
++  В модуле импорта EffectCraft (`effectcraft-interchange/src/import.rs`, строки 472–475) для всех неподдерживаемых генераторов задано стандартное поведение:
++  ```rust
++  _ => {
++      self.warn(format!("generator \"{}\" was imported as a grey solid", g.label()));
++      [0.5; 3] // сплошной 50% серый цвет RGB [0.5, 0.5, 0.5]
++  }
++  ```
++  В результате EffectCraft создавал слой `Solid` серого цвета вместо видеофутажа.
++* **Исправление:**  
++  В `crates/engine/src/effectcraft_bridge.rs` добавлена процедура автоматической материализации генераторов `materialize_generators_for_export`:
++  1. Перед выгрузкой в XML анализируются клипы передаваемой последовательности.
++  2. Если клип ссылается на `Generator::Demo(scene)`, встроенный энкодер FilmCraft (`filmcraft_export::export`) за доли секунды запекает кадры сцены в реальный MP4-видеофайл (`%TEMP%/FilmCraft_Demo_<Scene>.mp4`).
++  3. Временная последовательность перелинковывается на созданный физический MP4-файл (`MediaRef::File`).
++  4. В FCP7 XML теперь формируется полноценный блок:
++     ```xml
++     <clipitem>
++       <name>Misty_Forest.mp4</name>
++       <file>
++         <pathurl>file://localhost/C:/Users/.../AppData/Local/Temp/FilmCraft_Demo_Forest.mp4</pathurl>
++       </file>
++     </clipitem>
++     ```
++  5. EffectCraft импортирует его как `LayerSource::Footage`, подключает нативный декодер H.264/AAC и отображает полноценный живой видеоряд.
++  6. Для любых реальных пользовательских файлов (видео с камеры, экрана и т.д.) они уже являются `MediaRef::File` и сразу передаются как футажи.
++
++---
++
++## 3. Полный реестр изменений по файлам
++
++### Репозиторий 1: `FilmCraft` (`filmcraft-0.20.1`)
++
++#### 1. `crates/engine/src/effectcraft_bridge.rs` (Создан)
++* Логика выделения, запекания генераторов в MP4, формирования FCP7 XML, отправки по TCP Control Channel и запуска `effectcraft.exe` в скрытом режиме (`CREATE_NO_WINDOW | DETACHED_PROCESS`).
++
++#### 2. `crates/engine/src/effectcraft_bridge_tests.rs` (Создан)
++* Модульные тесты функционала моста (`bridge_fails_when_no_clips_selected`, `replace_with_effectcraft_creates_xml_and_replaces_on_timeline`, `send_to_effectcraft_keeps_original_timeline`).
++
++#### 3. `crates/engine/src/lib.rs`
++* Зарегистрирован публичный модуль `pub mod effectcraft_bridge`.
++
++#### 4. `crates/engine/src/commands.rs`
++* Зарегистрированы команды движка:
++  * `clip.replaceWithEffectCraft`
++  * `clip.sendToEffectCraft`
++
++#### 5. `crates/engine/src/clip_ops.rs`
++* Новые команды добавлены в реестр операций над клипами после `source.overwrite`.
++
++#### 6. `crates/ui-egui/src/panels/timeline/menus.rs`
++* В массив контекстного меню клипа `CLIP_MENU` добавлены:
++  * `("Replace with EffectCraft Composition", "clip.replaceWithEffectCraft")`
++  * `("Send to EffectCraft", "clip.sendToEffectCraft")`
++
++#### 7. `apps/filmcraft/src/main.rs`
++* Директива `#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]` гарантирует запуск без окна консоли.
++
++---
++
++### Репозиторий 2: `EffectCraft` (`effectcraft-0.24.1`)
++
++#### 1. `apps/effectcraft/src/main.rs`
++* Добавлена функция `is_timeline_file` и автоимпорт переданных файлов таймлайнов (`.xml`, `.otio`, `.edl`) при старте через CLI.
++* Директива `#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]` для подавления консоли.
++
++#### 2. `crates/engine/src/cmd/file.rs`
++* В команду общего импорта `file.import` добавлено распознавание файлов таймлайнов и перенаправление в `file.importTimeline` (работает Drag-and-Drop XML прямо в окно программы).
++
++#### 3. `crates/engine/src/cmd/timeline.rs`
++* Добавлена команда `file.sendToFilmCraft` для отправки композиции обратно в FilmCraft.
++
++#### 4. `crates/engine/src/tests/timeline_interchange.rs`
++* Добавлен тест `send_to_filmcraft_exports_xml`.
++
++---
++
++## 4. Размещение скомпилированных файлов
++
++Готовые оптимизированные исполняемые файлы (`--release`) копируются в портативные
++каталоги рядом с распакованным релизом:
++
++* `<портативный каталог FilmCraft>\filmcraft.exe`
++* `<портативный каталог EffectCraft>\effectcraft.exe`
++
++*(Оригинальные файлы сохраняются рядом с расширением `.exe.backup`.)*
+\ No newline at end of file
+--- a/apps/effectcraft/src/main.rs
++++ b/apps/effectcraft/src/main.rs
+@@ -12,7 +12,7 @@
+ //! taking keyboard focus and skips crash recovery, the Home screen (unless `--home`) and the
+ //! startup update check.
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
++#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+ 
+ // Built everywhere so its tests run on every platform; only Linux AppImages use it.
+ mod appearance;
+@@ -56,6 +56,18 @@
+         .extension()
+         .and_then(std::ffi::OsStr::to_str)
+         .is_some_and(|ext| ext.eq_ignore_ascii_case("ecproj") || ext.eq_ignore_ascii_case("ecprojx"))
++}
++
++/// Interchange timeline files (e.g. from FilmCraft or Premiere Pro).
++fn is_timeline_file(path: &str) -> bool {
++    std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|ext| {
++        ext.eq_ignore_ascii_case("xml")
++            || ext.eq_ignore_ascii_case("fcpxml")
++            || ext.eq_ignore_ascii_case("otio")
++            || ext.eq_ignore_ascii_case("edl")
++            || ext.eq_ignore_ascii_case("aaf")
++            || ext.eq_ignore_ascii_case("omf")
++    })
+ }
+ 
+ /// winit 0.30 cannot deliver native Wayland file drops. XWayland can.
+@@ -357,14 +369,19 @@
+             let _ = session.execute("file.runStartupScripts", json!({}));
+             let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
+             let project = files.iter().find(|f| is_project_file(f)).cloned();
++            let timeline = files.iter().find(|f| is_timeline_file(f)).cloned();
+             if let Some(p) = project {
+                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
+                     log::warn!("{p}: {e}");
+                 }
++            } else if let Some(t) = timeline {
++                if let Err(e) = session.execute("file.importTimeline", json!({"path": t})) {
++                    log::warn!("{t}: {e}");
++                }
+             } else if demo {
+                 let _ = session.execute("file.openDemoProject", json!({}));
+             }
+-            let media: Vec<String> = files.iter().filter(|f| !is_project_file(f)).cloned().collect();
++            let media: Vec<String> = files.iter().filter(|f| !is_project_file(f) && !is_timeline_file(f)).cloned().collect();
+             if !media.is_empty()
+                 && let Err(e) = session.execute("file.import", json!({"paths": media}))
+             {
+--- a/crates/engine/src/cmd.rs
++++ b/crates/engine/src/cmd.rs
+@@ -73,7 +73,7 @@
+ pub mod text_edit;
+ mod three_d;
+ pub mod time;
+-mod timeline;
++pub(crate) mod timeline;
+ mod track;
+ mod view;
+ pub mod viewer_cmds;
+--- a/crates/engine/src/cmd/file.rs
++++ b/crates/engine/src/cmd/file.rs
+@@ -104,12 +104,18 @@
+ 
+ fn save(s: &mut Session, p: &Value) -> Result<Value> {
+     let path = str_p(p, "path").map(str::to_string).or_else(|| s.path.clone()).ok_or_else(|| bad("file.save", "no path: use file.saveAs {path}"))?;
+-    save_to(s, &path)
++    let r = save_to(s, &path)?;
++    // CraftLink: a linked master is re-rendered after every save, so the FilmCraft timeline
++    // shows the edit without the user asking for an export.
++    crate::craftlink::auto_sync(s);
++    Ok(r)
+ }
+ 
+ fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
+     let path = str_p(p, "path").ok_or_else(|| bad("file.saveAs", "missing `path`"))?;
+-    save_to(s, path)
++    let r = save_to(s, path)?;
++    crate::craftlink::auto_sync(s);
++    Ok(r)
+ }
+ 
+ fn increment_save(s: &mut Session, _: &Value) -> Result<Value> {
+@@ -408,7 +414,11 @@
+     // Effects projects, refused when parts of them cannot come over. The app asks about those
+     // before it gets here (`panels::aep_losses`); a script or agent gets the refusal.
+     let (project_paths, paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::import_project::is_project_path(x));
+-    let (aep_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::is_aep_path(x));
++    let (aep_paths, paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::is_aep_path(x));
++    let (timeline_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| {
++        let p = x.to_ascii_lowercase();
++        p.ends_with(".xml") || p.ends_with(".fcpxml") || p.ends_with(".otio") || p.ends_with(".edl") || p.ends_with(".aaf") || p.ends_with(".omf")
++    });
+     let mut projects = vec![];
+     for path in project_paths {
+         match s.execute("file.importProject", json!({"path": path})) {
+@@ -424,6 +434,20 @@
+             Err(EngineError::Refused { losses, .. }) => errors.push(format!(
+                 "{path}: {losses}; File ▸ Import ▸ Adobe After Effects Project… lists them and can import the rest (`file.importAep` with `allowLosses`)"
+             )),
++            Err(e) => errors.push(format!("{path}: {e}")),
++        }
++    }
++    for path in timeline_paths {
++        match s.execute("file.importTimeline", json!({"path": path})) {
++            Ok(r) => {
++                if let Some(c_arr) = r.get("comps").and_then(Value::as_array) {
++                    for c in c_arr {
++                        if let Some(id) = c.as_u64() {
++                            comps.push(id);
++                        }
++                    }
++                }
++            }
+             Err(e) => errors.push(format!("{path}: {e}")),
+         }
+     }
+--- a/crates/engine/src/cmd/timeline.rs
++++ b/crates/engine/src/cmd/timeline.rs
+@@ -54,6 +54,9 @@
+     let res = s.edit("Import Timeline", None, |proj, st| {
+         let r = effectcraft_interchange::import(proj, &bytes, format, &opts, &mut probe).map_err(|e| EngineError::Other(e.to_string()))?;
+         st.project_selection = r.comps.clone();
++        // A timeline sent by FilmCraft's CraftLink carries a sidecar manifest naming the linked
++        // master: remember it on the composition so a later save re-renders that master.
++        crate::craftlink::register_import(proj, &r.comps, fp);
+         Ok(r)
+     })?;
+     if let Some(c) = res.comps.first() {
+@@ -100,13 +103,63 @@
+ }
+ 
+ /// What a pre-render needs from the session, so it can run on a background thread.
+-struct PrerenderCx {
++pub(crate) struct PrerenderCx {
+     protected: crate::output_guard::Protected,
+     exporter: Option<Arc<dyn Exporter>>,
+     footage: Arc<dyn effectcraft_render::FootageSource>,
+     expr: Option<Arc<dyn effectcraft_render::ExprHost>>,
+     accel: Option<Arc<dyn effectcraft_render::Accelerator>>,
+     nested_switches: bool,
++}
++
++/// The session's render context: the encoder, footage, expressions and GPU compositor a
++/// background render needs (`prerender`, CraftLink's `render_comp`).
++pub(crate) fn prerender_cx(s: &Session) -> PrerenderCx {
++    PrerenderCx {
++        protected: crate::output_guard::Protected::of(s),
++        exporter: s.exporter.clone(),
++        footage: s.footage.clone(),
++        expr: s.expr.clone(),
++        accel: s.accel.clone(),
++        nested_switches: s.prefs.general.switches_affect_nested_comps,
++    }
++}
++
++/// Render a whole composition to ProRes 4444 with alpha and PCM audio (a CraftLink master).
++pub(crate) fn render_comp(
++    cx: &PrerenderCx,
++    project: &Project,
++    cid: ItemId,
++    path: &str,
++    progress: &mut dyn FnMut(u64, u64) -> bool,
++) -> std::result::Result<crate::render_queue::ExportResult, String> {
++    let exporter = cx.exporter.as_ref().ok_or("export is not available in this build")?;
++    if !exporter.formats().contains(&OutputFormat::ProRes) {
++        return Err("ProRes export is not available in this build".into());
++    }
++    let mut item = RenderQueueItem::new(0, cid);
++    item.settings.time_span = TimeSpan::LengthOfComp;
++    item.output = OutputModule::for_format(OutputFormat::ProRes);
++    item.output.channels = Channels::Rgba;
++    item.output.prores_profile = ProResProfile::P4444;
++    item.output.audio = AudioOutput::Auto;
++    item.output.output = path.to_string();
++    let job = crate::ExportJob {
++        project,
++        footage: cx.footage.as_ref(),
++        expr: cx.expr.as_deref(),
++        accel: cx.accel.as_deref(),
++        item: &item,
++        path,
++        storage: None,
++        label: "CraftLink master".to_string(),
++        nested_switches: cx.nested_switches,
++
++        caches: None,
++        renderer: None,
++        gpu_frames: None,
++    };
++    exporter.export(&job, progress)
+ }
+ 
+ /// Render one layer to ProRes 4444 with alpha over its in–out span; `progress` as the exporter's.
+@@ -184,14 +237,7 @@
+     let relative_to = Some(dir.to_string_lossy().to_string()).filter(|d| !d.is_empty());
+     let opts = ExportOptions { format, prerender: prerender_mode, precomps, relative_to };
+     let project = s.project.clone();
+-    let cx = PrerenderCx {
+-        protected: crate::output_guard::Protected::of(s),
+-        exporter: s.exporter.clone(),
+-        footage: s.footage.clone(),
+-        expr: s.expr.clone(),
+-        accel: s.accel.clone(),
+-        nested_switches: s.prefs.general.switches_affect_nested_comps,
+-    };
++    let cx = prerender_cx(s);
+     // The pre-renders can take minutes: with `background` (the export dialog) they run as a job
+     // in Window ▸ Progress instead of with the window waiting (#2269).
+     let wait = !b_p(p, "background").unwrap_or(false);
+@@ -284,6 +330,168 @@
+     ))
+ }
+ 
++fn send_to_filmcraft(s: &mut Session, p: &Value) -> Result<Value> {
++    let cid = comp_id(s, p)?;
++    let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_else(|| "Composition".into());
++
++    let xml_path = if let Some(path) = str_p(p, "path") {
++        std::path::PathBuf::from(path)
++    } else if let Some(proj_path) = s.path.as_ref() {
++        let parent = std::path::Path::new(proj_path).parent().unwrap_or_else(|| std::path::Path::new("."));
++        parent.join(format!("{comp_name}.xml"))
++    } else {
++        std::env::temp_dir().join(format!("{comp_name}_{}.xml", std::process::id()))
++    };
++
++    let path_str = xml_path.to_string_lossy().to_string();
++    let mut export_params = p.clone();
++    if !export_params.is_object() {
++        export_params = json!({});
++    }
++    export_params["path"] = json!(path_str);
++    export_params["comp"] = json!(cid.0);
++    export_params["format"] = json!("xml");
++
++    let export_result = export_timeline(s, &export_params)?;
++    let filmcraft_result = launch_or_notify_filmcraft(&path_str);
++
++    s.toast(format!("Sent to FilmCraft: {comp_name}"));
++
++    Ok(json!({
++        "comp": cid.0,
++        "name": comp_name,
++        "path": path_str,
++        "export": export_result,
++        "filmcraft": filmcraft_result,
++    }))
++}
++
++fn launch_or_notify_filmcraft(xml_path: &str) -> Value {
++    if let Ok(()) = send_to_filmcraft_control(xml_path) {
++        return json!({
++            "status": "connected_to_control_server",
++            "message": "Sent timeline to running FilmCraft instance"
++        });
++    }
++
++    if let Some(exe) = find_filmcraft_exe() {
++        match std::process::Command::new(&exe).arg(xml_path).spawn() {
++            Ok(child) => {
++                return json!({
++                    "status": "launched",
++                    "pid": child.id(),
++                    "executable": exe.to_string_lossy().to_string(),
++                });
++            }
++            Err(e) => {
++                return json!({
++                    "status": "launch_failed",
++                    "error": e.to_string(),
++                    "executable": exe.to_string_lossy().to_string(),
++                });
++            }
++        }
++    }
++
++    json!({
++        "status": "saved_only",
++        "message": "Exported XML timeline. Open FilmCraft and import this file.",
++        "path": xml_path
++    })
++}
++
++fn send_to_filmcraft_control(xml_path: &str) -> std::result::Result<(), String> {
++    use std::io::{BufRead, BufReader, Write};
++    use std::net::{SocketAddr, TcpStream};
++    use std::time::Duration;
++
++    let mut ports = vec![9876];
++    // Missing or malformed discovery files just mean "try the default port".
++    for file in [std::path::PathBuf::from("filmcraft_control.json"), std::env::temp_dir().join("filmcraft_control.json")] {
++        let Ok(content) = std::fs::read_to_string(file) else { continue };
++        let Ok(v) = serde_json::from_str::<Value>(&content) else { continue };
++        if let Some(p) = v.get("port").and_then(Value::as_u64) {
++            ports.insert(0, p as u16);
++        }
++    }
++
++    for port in ports {
++        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
++        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
++            continue;
++        };
++        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
++        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
++
++        let req = json!({
++            "method": "engine.execute",
++            "params": {
++                "command": "file.import",
++                "params": {
++                    "paths": [xml_path]
++                }
++            }
++        });
++
++        if writeln!(stream, "{}", req).is_err() {
++            continue;
++        }
++        let mut reader = BufReader::new(stream);
++        let mut resp = String::new();
++        if reader.read_line(&mut resp).is_ok() && !resp.trim().is_empty() {
++            return Ok(());
++        }
++    }
++    Err("FilmCraft control channel unavailable".into())
++}
++
++fn find_filmcraft_exe() -> Option<std::path::PathBuf> {
++    if let Ok(path) = std::env::var("FILMCRAFT_PATH") {
++        let p = std::path::PathBuf::from(path);
++        if p.is_file() {
++            return Some(p);
++        }
++    }
++
++    if let Ok(curr) = std::env::current_exe()
++        && let Some(parent) = curr.parent()
++    {
++        let candidates = [parent.join("filmcraft.exe"), parent.join("../FilmCraft/filmcraft.exe"), parent.join("../../FilmCraft/filmcraft.exe")];
++        for c in candidates {
++            if c.is_file() {
++                return Some(c);
++            }
++        }
++    }
++
++    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
++    let candidates =
++        [std::path::Path::new(&program_files).join(r"ArtCraft\FilmCraft\filmcraft.exe"), std::path::Path::new(&program_files).join(r"FilmCraft\filmcraft.exe")];
++    for c in candidates {
++        if c.is_file() {
++            return Some(c);
++        }
++    }
++
++    if let Ok(path_var) = std::env::var("PATH") {
++        for dir in std::env::split_paths(&path_var) {
++            let exe = dir.join("filmcraft.exe");
++            if exe.is_file() {
++                return Some(exe);
++            }
++            #[cfg(unix)]
++            {
++                let exe = dir.join("filmcraft");
++                if exe.is_file() {
++                    return Some(exe);
++                }
++            }
++        }
++    }
++
++    None
++}
++
+ pub fn specs() -> Vec<CommandSpec> {
+     vec![
+         cmd!(
+@@ -304,6 +512,17 @@
+             has_comp,
+             export_timeline
+         ),
++        cmd!("file.sendToFilmCraft", "Send to FilmCraft...", ["File", "Export"], None, "{comp?, path?}", has_comp, send_to_filmcraft),
++        cmd!(
++            "file.craftlinkSync",
++            "Update CraftLink Render",
++            ["File", "Export"],
++            None,
++            "{comp?, background?: bool (render as a job; returns {job})}",
++            has_comp,
++            crate::craftlink::sync
++        ),
++        cmd!("file.craftlinkStatus", "CraftLink Status", [], None, "{comp?}", has_comp, crate::craftlink::status),
+         cmd!("file.timelineFormats", "Timeline Interchange Formats", [], None, "{}", always, timeline_formats),
+     ]
+ }
+--- /dev/null
++++ b/crates/engine/src/craftlink.rs
+@@ -0,0 +1,525 @@
++//! CraftLink: the receiving end of the live composition link with FilmCraft.
++//!
++//! A timeline sent from FilmCraft arrives as an ordinary Final Cut Pro 7 XML file, with a
++//! sidecar manifest next to it (`<name>.craftlink.json`) that names the composition, the
++//! timeline file and the rendered master FilmCraft shows. This module:
++//!
++//! - reads that manifest and remembers it on the imported composition (`Item.comment`), so the
++//!   link survives saving and reopening the project;
++//! - re-renders the composition to the linked master on demand (`file.craftlinkSync`) and, when
++//!   the manifest asks for it, after every File ▸ Save (`auto_sync`);
++//! - tells FilmCraft that the master changed with a small spool file in the temp folder (and,
++//!   when it is running with a control token, a loopback request), so the FilmCraft timeline
++//!   updates at once.
++//!
++//! Everything is an open format: Final Cut Pro 7 XML (`<xmeml>`), Apple ProRes 4444 in
++//! QuickTime, a JSON sidecar and a JSON-lines loopback request. No proprietary protocol or
++//! shared library is involved, so the behaviour can be reimplemented from this description.
++
++use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++use effectcraft_project::ItemId;
++use serde_json::{Value, json};
++
++use crate::cmd::{b_p, bad, comp_id};
++use crate::jobs::Apply;
++use crate::{Result, Session};
++
++/// Version of the sidecar manifest this build reads and writes.
++pub const MANIFEST_VERSION: u32 = 1;
++/// Folder (in the temp folder) FilmCraft polls for "a linked master changed" notices.
++pub const LINK_FOLDER: &str = "CraftLink";
++/// Suffix of the sidecar manifest next to the timeline file.
++pub const MANIFEST_SUFFIX: &str = ".craftlink.json";
++/// Marks the JSON line stored in `Item.comment`.
++pub const COMMENT_PREFIX: &str = "craftlink:";
++/// How long the live link waits after the last edit before re-rendering, in seconds: long enough
++/// to fold a slider drag or a burst of keystrokes into one render, short enough to feel immediate.
++pub const LIVE_DELAY: f64 = 1.0;
++
++/// Commands that change the document without being an edit of a linked composition: opening,
++/// creating, reverting or importing a project, and the link's own commands. They must not arm the
++/// live render (a freshly opened project would otherwise render on top of its own master).
++const LIVE_IGNORED: &[&str] = &[
++    "file.save",
++    "file.saveAs",
++    "file.saveCopy",
++    "file.saveCopyAsXml",
++    "file.craftlinkSync",
++    "file.open",
++    "file.openDemoProject",
++    "file.newProject",
++    "file.revert",
++    "file.openRecent",
++    "file.importTimeline",
++    "file.import",
++    "file.importProject",
++    "file.importAep",
++    "file.importMultiple",
++];
++
++/// The debounced live link: the active linked composition re-renders its master shortly after an
++/// edit, without waiting for File ▸ Save.
++///
++/// The engine has no clock, so [`Session::craftlink_note_change`] only records that something
++/// changed and [`Session::craftlink_tick`] — called from the frontend's frame loop with its
++/// monotonic clock — decides when the quiet period is over.
++#[derive(Clone, Debug, Default)]
++pub struct LiveSync {
++    /// An edit is waiting for the quiet period to expire.
++    dirty: bool,
++    /// When the quiet period started (`None`: the next tick starts it).
++    since: Option<f64>,
++    /// The last project revision handled: a change counts once.
++    seen: u64,
++    /// The linked composition that was active when the change was recorded.
++    comp: Option<ItemId>,
++    /// Renders the live link started (tests and `file.craftlinkStatus`).
++    pub rendered: u64,
++}
++
++/// One CraftLink, as written by FilmCraft in the sidecar manifest.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CraftLinkSource {
++    pub version: u32,
++    /// The composition's name in FilmCraft.
++    pub composition: String,
++    /// The Final Cut Pro 7 XML timeline that was imported.
++    pub xml: String,
++    /// The ProRes 4444 master FilmCraft shows and this composition renders to.
++    pub render: String,
++    /// Re-render the master after every save.
++    pub auto_sync: bool,
++    /// The application that created the link ("FilmCraft").
++    pub application: String,
++}
++
++impl CraftLinkSource {
++    /// Reads a manifest value (`{craftlink, composition, xml, render, autoSync, application}`).
++    pub fn from_value(v: &Value) -> Option<Self> {
++        let render = v.get("render").and_then(Value::as_str)?.to_string();
++        if render.trim().is_empty() {
++            return None;
++        }
++        Some(Self {
++            version: v.get("craftlink").and_then(Value::as_u64).unwrap_or(MANIFEST_VERSION as u64) as u32,
++            composition: v.get("composition").and_then(Value::as_str).unwrap_or_default().to_string(),
++            xml: v.get("xml").and_then(Value::as_str).unwrap_or_default().to_string(),
++            render,
++            auto_sync: v.get("autoSync").and_then(Value::as_bool).unwrap_or(true),
++            application: v.get("application").and_then(Value::as_str).unwrap_or("FilmCraft").to_string(),
++        })
++    }
++
++    /// The manifest value.
++    pub fn to_value(&self) -> Value {
++        json!({
++            "craftlink": self.version,
++            "composition": self.composition,
++            "xml": self.xml,
++            "render": self.render,
++            "autoSync": self.auto_sync,
++            "application": self.application,
++        })
++    }
++
++    /// The line stored in `Item.comment` so the link survives a project reload.
++    pub fn to_comment(&self) -> String {
++        format!("{COMMENT_PREFIX}{}", self.to_value())
++    }
++
++    /// The link stored in an item's comment, if the comment is one.
++    pub fn from_comment(comment: &str) -> Option<Self> {
++        let rest = comment.strip_prefix(COMMENT_PREFIX)?;
++        let v: Value = serde_json::from_str(rest.trim()).ok()?;
++        Self::from_value(&v)
++    }
++}
++
++/// The sidecar manifest that belongs to a timeline file.
++pub fn manifest_path(xml: &Path) -> PathBuf {
++    let mut name = xml.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "CraftLink".into());
++    name.push_str(MANIFEST_SUFFIX);
++    xml.with_file_name(name)
++}
++
++/// Reads the manifest next to `xml`, if there is one and it names a master.
++pub fn source_for_timeline(xml: &Path) -> Option<CraftLinkSource> {
++    let text = std::fs::read_to_string(manifest_path(xml)).ok()?;
++    let v: Value = serde_json::from_str(&text).ok()?;
++    CraftLinkSource::from_value(&v)
++}
++
++/// The link a composition was imported with, from its item comment.
++pub fn source_of(s: &Session, cid: ItemId) -> Option<CraftLinkSource> {
++    CraftLinkSource::from_comment(&s.project.item(cid)?.comment)
++}
++
++/// A temporary name next to the master, so a failed render never leaves a half-written file
++/// where FilmCraft reads it.
++fn partial_path(render: &str) -> String {
++    let p = Path::new(render);
++    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "master".into());
++    let name = match p.extension().map(|s| s.to_string_lossy().to_string()) {
++        Some(e) => format!("{stem}.partial.{e}"),
++        None => format!("{stem}.partial"),
++    };
++    p.with_file_name(name).to_string_lossy().to_string()
++}
++
++/// Tells FilmCraft that a linked master changed: a spool file it polls while it runs, plus a
++/// best-effort loopback request when it was started with a control token.
++pub fn notify_filmcraft(render: &str) {
++    let dir = std::env::temp_dir().join(LINK_FOLDER);
++    if std::fs::create_dir_all(&dir).is_err() {
++        return;
++    }
++    let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
++    let name = format!("reload-{}-{stamp}.notify", std::process::id());
++    let body = json!({"craftlink": MANIFEST_VERSION, "render": render}).to_string();
++    let _ = std::fs::write(dir.join(name), body);
++    // A FilmCraft that is not running leaves the spool behind: drop what is old.
++    if let Ok(entries) = std::fs::read_dir(&dir) {
++        let now = SystemTime::now();
++        for e in entries.flatten() {
++            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| now.duration_since(t).ok()).is_some_and(|d| d.as_secs() > 600);
++            if old {
++                let _ = std::fs::remove_file(e.path());
++            }
++        }
++    }
++    let _ = notify_filmcraft_control();
++}
++
++/// `craftlink.refresh` on a running FilmCraft, authenticated with the control token the process
++/// inherited (`FILMCRAFT_CONTROL_TOKEN`, 64 hex characters). FilmCraft keeps its listener closed
++/// without that token, so the spool file above remains the only notification it needs.
++fn notify_filmcraft_control() -> std::result::Result<(), String> {
++    use std::io::{BufRead, BufReader, Write};
++    use std::net::{SocketAddr, TcpStream};
++    use std::time::Duration;
++
++    let token = std::env::var("FILMCRAFT_CONTROL_TOKEN").ok().filter(|t| t.len() == 64).ok_or("no control token")?;
++
++    let mut ports = vec![9876];
++    for file in [PathBuf::from("filmcraft_control.json"), std::env::temp_dir().join("filmcraft_control.json")] {
++        // A missing or malformed discovery file just means "use the default port".
++        let Ok(content) = std::fs::read_to_string(file) else { continue };
++        let Ok(v) = serde_json::from_str::<Value>(&content) else { continue };
++        if let Some(p) = v.get("port").and_then(Value::as_u64) {
++            ports.insert(0, p as u16);
++        }
++    }
++
++    for port in ports {
++        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
++        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
++            continue;
++        };
++        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
++        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
++        let req = json!({
++            "token": token,
++            "method": "engine.execute",
++            "params": {"command": "craftlink.refresh", "params": {}},
++        });
++        if writeln!(stream, "{req}").is_err() {
++            continue;
++        }
++        let mut resp = String::new();
++        if BufReader::new(stream).read_line(&mut resp).is_ok() && !resp.trim().is_empty() {
++            return Ok(());
++        }
++    }
++    Err("FilmCraft control channel unavailable".into())
++}
++
++/// Renders `cid` to its linked master in the background (`wait` renders it before returning).
++/// `quiet` leaves the "updated" toast out: the live link renders often and must not chatter.
++fn spawn_render(s: &mut Session, cid: ItemId, src: &CraftLinkSource, wait: bool, quiet: bool) -> Result<Value> {
++    let cx = crate::cmd::timeline::prerender_cx(s);
++    let project = s.project.clone();
++    let (render, xml, composition) = (src.render.clone(), src.xml.clone(), src.composition.clone());
++    let label = if composition.is_empty() { "CraftLink".to_string() } else { format!("CraftLink {composition}") };
++    s.spawn_task("craftlink", label, wait, move |ctl| {
++        let partial = partial_path(&render);
++        if let Some(parent) = Path::new(&partial).parent() {
++            let _ = std::fs::create_dir_all(parent);
++        }
++        let mut progress = |_: u64, _: u64| !ctl.cancelled();
++        crate::cmd::timeline::render_comp(&cx, &project, cid, &partial, &mut progress)?;
++        // The master is replaced only once the whole render is written: FilmCraft may be
++        // reading the old one right now.
++        std::fs::rename(&partial, &render).map_err(|e| {
++            let _ = std::fs::remove_file(&partial);
++            format!("cannot replace {render}: {e}")
++        })?;
++        notify_filmcraft(&render);
++        let done = render.clone();
++        Ok(Box::new(move |s: &mut Session| {
++            if !quiet {
++                s.toast(format!("CraftLink: updated {}", done));
++            }
++            Ok(json!({"comp": cid.0, "render": done, "xml": xml}))
++        }) as Apply)
++    })
++}
++
++/// `file.craftlinkSync`: re-render the linked master now.
++pub fn sync(s: &mut Session, p: &Value) -> Result<Value> {
++    let cid = comp_id(s, p)?;
++    let src = source_of(s, cid).ok_or_else(|| {
++        bad(
++            "file.craftlinkSync",
++            "this composition has no CraftLink: import a timeline sent from FilmCraft (Clip ▸ Replace with EffectCraft Composition) first",
++        )
++    })?;
++    let wait = !b_p(p, "background").unwrap_or(false);
++    spawn_render(s, cid, &src, wait, false)
++}
++
++/// `file.craftlinkStatus`: what the composition is linked to and whether its master exists.
++pub fn status(s: &mut Session, p: &Value) -> Result<Value> {
++    let cid = comp_id(s, p)?;
++    let name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
++    let Some(src) = source_of(s, cid) else {
++        return Ok(json!({"comp": cid.0, "name": name, "linked": false}));
++    };
++    let meta = std::fs::metadata(&src.render).ok();
++    Ok(json!({
++        "comp": cid.0,
++        "name": name,
++        "linked": true,
++        "composition": src.composition,
++        "xml": src.xml,
++        "render": src.render,
++        "autoSync": src.auto_sync,
++        "application": src.application,
++        "exists": meta.is_some(),
++        "bytes": meta.as_ref().map(|m| m.len()),
++        "modified": meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_millis()),
++    }))
++}
++
++/// After File ▸ Save / Save As: re-render every linked master whose manifest asks for it.
++///
++/// One render at a time: a save while a CraftLink render is still running leaves the next one to
++/// the following save rather than stacking jobs.
++pub fn auto_sync(s: &mut Session) {
++    if s.tasks.iter().any(|t| t.kind == "craftlink") {
++        return;
++    }
++    let jobs: Vec<(ItemId, CraftLinkSource)> =
++        s.project.items.values().filter_map(|i| CraftLinkSource::from_comment(&i.comment).map(|src| (i.id, src))).filter(|(_, src)| src.auto_sync).collect();
++    for (cid, src) in jobs {
++        let _ = spawn_render(s, cid, &src, false, false);
++    }
++}
++
++impl Session {
++    /// A command changed the project: remember that the active linked composition needs a fresh
++    /// master. [`Session::craftlink_tick`] starts the render once the edits settle.
++    ///
++    /// Called by [`Session::execute`] for every command that advanced [`Session::revision`].
++    pub fn craftlink_note_change(&mut self, id: &str) {
++        if self.revision == self.craftlink_live.seen {
++            return;
++        }
++        if LIVE_IGNORED.contains(&id) {
++            // The document was replaced rather than edited: don't render the newcomer on top of
++            // the master it was opened from.
++            self.craftlink_live.seen = self.revision;
++            return;
++        }
++        self.craftlink_live.dirty = true;
++        // The next tick starts the quiet period again: the last edit wins.
++        self.craftlink_live.since = None;
++        self.craftlink_live.comp = self.active_comp_id();
++    }
++
++    /// The live link is waiting for its quiet period or its render.
++    pub fn craftlink_live_pending(&self) -> bool {
++        self.craftlink_live.dirty
++    }
++
++    /// Frontend frame work for the live link: re-render the linked composition that was active
++    /// when the edit happened, once no edit arrived for [`LIVE_DELAY`] seconds. One render at a
++    /// time: an edit during a render waits for it to finish.
++    ///
++    /// `now` is the frontend's monotonic clock in seconds (the engine has none).
++    pub fn craftlink_tick(&mut self, now: f64) {
++        if !self.craftlink_live.dirty || self.tasks.iter().any(|t| t.kind == "craftlink") {
++            return;
++        }
++        let Some(cid) = self.craftlink_live.comp.filter(|c| self.project.comp(*c).is_some()) else {
++            self.craftlink_live.dirty = false;
++            return;
++        };
++        let Some(src) = source_of(self, cid) else {
++            // The composition was unlinked (or is not linked at all): nothing to render.
++            self.craftlink_live.dirty = false;
++            return;
++        };
++        if !src.auto_sync {
++            // The link was imported with automatic syncing off: only File ▸ Save renders it.
++            self.craftlink_live.dirty = false;
++            self.craftlink_live.seen = self.revision;
++            return;
++        }
++        let since = match self.craftlink_live.since {
++            Some(t) => t,
++            None => {
++                self.craftlink_live.since = Some(now);
++                now
++            }
++        };
++        if now - since < LIVE_DELAY {
++            return;
++        }
++        self.craftlink_live.dirty = false;
++        self.craftlink_live.since = None;
++        self.craftlink_live.seen = self.revision;
++        self.craftlink_live.rendered += 1;
++        let _ = spawn_render(self, cid, &src, false, true);
++    }
++}
++
++/// Remembers the link on the composition that was just imported from a CraftLink timeline.
++pub fn register_import(project: &mut effectcraft_project::Project, comps: &[ItemId], xml: &Path) {
++    let Some(src) = source_for_timeline(xml) else { return };
++    let comment = src.to_comment();
++    for cid in comps {
++        if let Some(item) = project.item_mut(*cid) {
++            item.comment = comment.clone();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_manifest_round_trips_through_a_comment() {
++        let src = CraftLinkSource {
++            version: MANIFEST_VERSION,
++            composition: "CraftLink Comp 01".into(),
++            xml: "C:\\p\\CraftLink Comp 01.xml".into(),
++            render: "C:\\p\\CraftLink\\CraftLink Comp 01.mov".into(),
++            auto_sync: true,
++            application: "FilmCraft".into(),
++        };
++        let back = CraftLinkSource::from_comment(&src.to_comment()).unwrap();
++        assert_eq!(back, src);
++    }
++
++    #[test]
++    fn a_plain_comment_is_not_a_link() {
++        assert!(CraftLinkSource::from_comment("a note about this comp").is_none());
++        assert!(CraftLinkSource::from_comment("craftlink:not json").is_none());
++    }
++
++    #[test]
++    fn the_manifest_sits_next_to_the_timeline() {
++        let p = manifest_path(Path::new("C:\\p\\Comp.xml"));
++        assert_eq!(p, PathBuf::from("C:\\p\\Comp.craftlink.json"));
++    }
++
++    #[test]
++    fn a_partial_render_keeps_the_extension() {
++        assert_eq!(partial_path("C:\\p\\Comp.mov"), "C:\\p\\Comp.partial.mov");
++        assert_eq!(partial_path("C:\\p\\Comp"), "C:\\p\\Comp.partial");
++    }
++
++    // ---------------------------------------------------------------- live link
++
++    fn demo() -> Session {
++        let mut s = Session::default();
++        s.execute("file.openDemoProject", json!({})).unwrap();
++        s
++    }
++
++    /// Give the demo's active composition a link, as an import from FilmCraft would.
++    fn link(s: &mut Session, cid: ItemId, auto_sync: bool) {
++        let src = CraftLinkSource {
++            version: MANIFEST_VERSION,
++            composition: "CraftLink Comp 01".into(),
++            xml: "C:\\p\\CraftLink Comp 01.xml".into(),
++            render: "C:\\p\\CraftLink\\CraftLink Comp 01.mov".into(),
++            auto_sync,
++            application: "FilmCraft".into(),
++        };
++        std::sync::Arc::make_mut(&mut s.project).item_mut(cid).unwrap().comment = src.to_comment();
++    }
++
++    #[test]
++    fn an_edit_arms_the_live_link() {
++        let mut s = demo();
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        assert!(s.craftlink_live_pending(), "an edit of the project arms the live render");
++    }
++
++    #[test]
++    fn opening_a_document_does_not_arm_the_live_link() {
++        let mut s = demo();
++        s.bump();
++        s.craftlink_note_change("file.open");
++        assert!(!s.craftlink_live_pending(), "a replaced document is not an edit to render");
++    }
++
++    #[test]
++    fn the_live_link_waits_for_the_quiet_period() {
++        let mut s = demo();
++        let cid = s.active_comp_id().expect("the demo opens a composition");
++        link(&mut s, cid, true);
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        s.craftlink_tick(10.0);
++        s.craftlink_tick(10.0 + LIVE_DELAY / 2.0);
++        assert_eq!(s.craftlink_live.rendered, 0, "nothing renders before the quiet period ends");
++        assert!(s.craftlink_live_pending(), "the render is still owed");
++    }
++
++    #[test]
++    fn a_new_edit_restarts_the_quiet_period() {
++        let mut s = demo();
++        let cid = s.active_comp_id().expect("the demo opens a composition");
++        link(&mut s, cid, true);
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        s.craftlink_tick(10.0);
++        // Another edit 0.6 s later: the render waits for a full quiet second after it.
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        s.craftlink_tick(10.6);
++        s.craftlink_tick(10.6 + LIVE_DELAY / 2.0);
++        assert_eq!(s.craftlink_live.rendered, 0);
++        assert!(s.craftlink_live_pending());
++    }
++
++    #[test]
++    fn an_unlinked_composition_is_not_rendered_by_the_live_link() {
++        let mut s = demo();
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        s.craftlink_tick(0.0);
++        s.craftlink_tick(LIVE_DELAY + 1.0);
++        assert_eq!(s.craftlink_live.rendered, 0);
++        assert!(!s.craftlink_live_pending(), "an unlinked composition leaves no debt");
++    }
++
++    #[test]
++    fn a_link_with_auto_sync_off_waits_for_a_save() {
++        let mut s = demo();
++        let cid = s.active_comp_id().expect("the demo opens a composition");
++        link(&mut s, cid, false);
++        s.bump();
++        s.craftlink_note_change("prop.set");
++        s.craftlink_tick(0.0);
++        s.craftlink_tick(LIVE_DELAY + 1.0);
++        assert_eq!(s.craftlink_live.rendered, 0, "autoSync off renders only on File ▸ Save");
++        assert!(!s.craftlink_live_pending());
++    }
++}
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -13,6 +13,7 @@
+ mod analysis;
+ mod background;
+ pub mod cmd;
++mod craftlink;
+ mod footage;
+ pub mod history;
+ mod home;
+@@ -47,6 +48,7 @@
+ pub use background::remote;
+ pub use cmd as commands;
+ pub use cmd::{CommandSpec, command_specs, find as find_command};
++pub use craftlink::LiveSync;
+ pub use effectcraft_color as color;
+ pub use effectcraft_effects as effects;
+ pub use effectcraft_geom as geom;
+@@ -243,6 +245,9 @@
+     pub offload_log_start: usize,
+     /// Generic background tasks (Content-Aware Fill, Scene Edit Detection), see [`jobs`].
+     pub tasks: Vec<jobs::Task>,
++    /// The debounced CraftLink live render of the active linked composition (see
++    /// `craftlink::LiveSync` and [`Session::craftlink_tick`]).
++    pub craftlink_live: LiveSync,
+     /// Finished tasks, newest last (Progress panel, `jobs.list`).
+     pub job_log: Vec<jobs::JobRecord>,
+     pub next_task_id: u64,
+@@ -382,6 +387,7 @@
+             browser: None,
+             storage: None,
+             tasks: vec![],
++            craftlink_live: LiveSync::default(),
+             job_log: vec![],
+             next_task_id: 1,
+             learn: None,
+--- a/crates/engine/src/menus.rs
++++ b/crates/engine/src/menus.rs
+@@ -602,6 +602,9 @@
+     Adobe After Effects Project... | file.exportAep
+     Lottie JSON... | file.exportLottie
+     Essential Graphics Template... | essential.exportTemplate
++    ---
++    Send to FilmCraft... | file.sendToFilmCraft
++    Update CraftLink Render | file.craftlinkSync
+   ---
+   Find | app.find
+   ---
+--- a/crates/engine/src/session/dispatch.rs
++++ b/crates/engine/src/session/dispatch.rs
+@@ -11,6 +11,7 @@
+             return Err(EngineError::Other(crate::scriptui::RENDER_WAIT_MESSAGE.into()));
+         }
+         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
++        let revision_before = self.revision;
+         if let Err(why) = (spec.enabled)(self) {
+             // Explicit targets (agents, scripts) don't need a UI selection.
+             let explicit = (["layer", "layers", "prop", "keys"].iter().any(|k| params.get(k).is_some()) && commands::has_comp(self).is_ok())
+@@ -27,6 +28,11 @@
+         let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+         let r = crate::replay::after_command(self, id, &params, &nesting, caught, r)?;
+         self.learn_observe(id, &params);
++        // CraftLink: an edit to a linked composition re-renders its master after a short quiet
++        // period, without File ▸ Save (see `craftlink::LiveSync`).
++        if self.revision != revision_before {
++            self.craftlink_note_change(id);
++        }
+         if spec.journal && !nesting.inside_journaled() {
+             // Revert and Open Recent resolve a file the parameters may not name. Store
+             // the successful read as an explicit open boundary while its resolved path is known.
+--- a/crates/engine/src/tests/timeline_interchange.rs
++++ b/crates/engine/src/tests/timeline_interchange.rs
+@@ -72,3 +72,17 @@
+     assert_eq!(find("file.exportTimeline"), Some(("File > Export".into(), "Adobe Premiere Pro Project...".into())));
+     assert_eq!(find("file.importTimeline"), Some(("File > Import".into(), "Adobe Premiere Pro Project...".into())));
+ }
++
++#[test]
++fn send_to_filmcraft_exports_xml() {
++    let mut s = Session::default();
++    s.execute("comp.new", json!({"name": "TestFilmCraftComp", "width": 320, "height": 180, "frameRate": 25, "duration": 2})).unwrap();
++    let cid = s.active_comp_id().unwrap();
++    let out = tmp("SendToFilmCraft.xml");
++    let r = s.execute("file.sendToFilmCraft", json!({"comp": cid.0, "path": out})).unwrap();
++    assert_eq!(r["name"], "TestFilmCraftComp");
++    assert!(r["path"].as_str().unwrap().ends_with("SendToFilmCraft.xml"));
++    assert!(std::path::Path::new(r["path"].as_str().unwrap()).exists());
++    let content = std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap();
++    assert!(content.contains("<xmeml"));
++}
+--- a/crates/ui-egui/src/app/frame.rs
++++ b/crates/ui-egui/src/app/frame.rs
+@@ -218,6 +218,16 @@
+         if !self.session.tasks.is_empty() {
+             self.session.poll_jobs();
+             ctx.request_repaint_after(std::time::Duration::from_millis(100));
++        }
++        // CraftLink: re-render the active linked composition a moment after its last edit, so the
++        // FilmCraft timeline follows without File ▸ Save. Desktop only: the link lives in a folder
++        // on disk, and a browser session would render inline (there is no background thread).
++        #[cfg(not(target_arch = "wasm32"))]
++        {
++            self.session.craftlink_tick(self.now);
++            if self.session.craftlink_live_pending() {
++                ctx.request_repaint_after(std::time::Duration::from_millis(120));
++            }
+         }
+         // Analyses running in a worker (the web app).
+         if !self.session.offloaded.is_empty() {
